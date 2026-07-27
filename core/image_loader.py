@@ -1,4 +1,7 @@
 from pathlib import Path
+
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
  
 from pdf2image import convert_from_path
  
@@ -15,7 +18,8 @@ class PDFImageLoader:
  
         images = convert_from_path(
             pdf_path,
-            dpi=self.dpi
+            dpi=self.dpi,
+            poppler_path=r"C:\Users\LGRnD\Downloads\poppler-26.02.0\Library\bin"
         )
  
         return images
