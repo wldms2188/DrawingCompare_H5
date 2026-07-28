@@ -4,7 +4,13 @@ import cv2
  
 class Cropper:
  
-    def crop_changes(self, before_img, after_img, changes, save_dir="output/crops"):
+    def crop_changes(
+        self,
+        before_img,
+        after_img,
+        changes,
+        save_dir="output/crops"
+    ):
  
         os.makedirs(save_dir, exist_ok=True)
  
@@ -15,8 +21,15 @@ class Cropper:
             x1 = max(0, change.x - margin)
             y1 = max(0, change.y - margin)
  
-            x2 = min(before_img.shape[1], change.x + change.w + margin)
-            y2 = min(before_img.shape[0], change.y + change.h + margin)
+            x2 = min(
+                before_img.shape[1],
+                change.x + change.w + margin
+            )
+ 
+            y2 = min(
+                before_img.shape[0],
+                change.y + change.h + margin
+            )
  
             before_crop = before_img[y1:y2, x1:x2]
             after_crop = after_img[y1:y2, x1:x2]

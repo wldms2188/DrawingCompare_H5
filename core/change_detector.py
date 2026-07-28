@@ -1,55 +1,54 @@
 import cv2
  
+from core.change_info import ChangeInfo
+ 
  
 class ChangeDetector:
  
-    def __init__(self, threshold=30, min_area=100):
-        self.threshold = threshold
-        self.min_area = min_area
- 
     def detect(self, before_img, after_img):
  
-        before_gray = cv2.cvtColor(before_img, cv2.COLOR_BGR2GRAY)
-        after_gray = cv2.cvtColor(after_img, cv2.COLOR_BGR2GRAY)
+        gray1 = cv2.cvtColor(before_img, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(after_img, cv2.COLOR_BGR2GRAY)
  
-        diff = cv2.absdiff(before_gray, after_gray)
+        diff = cv2.absdiff(gray1, gray2)
  
-        _, binary = cv2.threshold(
+        _, thresh = cv2.threshold(
             diff,
-            self.threshold,
+            30,
             255,
             cv2.THRESH_BINARY
         )
  
         kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT,
-            (3, 3)
+            (5, 5)
         )
  
-        binary = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_OPEN,
-            kernel
+        thresh = cv2.dilate(
+            thresh,
+            kernel,
+            iterations=2
         )
  
         contours, _ = cv2.findContours(
-            binary,
+            thresh,
             cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_SIMPLE
         )
  
-        boxes = []
- 
         result = after_img.copy()
+        changes = []
+ 
+        change_id = 1
  
         for contour in contours:
  
-            if cv2.contourArea(contour) < self.min_area:
+            area = cv2.contourArea(contour)
+ 
+            if area < 100:
                 continue
  
             x, y, w, h = cv2.boundingRect(contour)
- 
-            boxes.append((x, y, w, h))
  
             cv2.rectangle(
                 result,
@@ -59,4 +58,17 @@ class ChangeDetector:
                 2
             )
  
-        return result, boxes
+            changes.append(
+                ChangeInfo(
+                    id=change_id,
+                    page=1,
+                    x=x,
+                    y=y,
+                    w=w,
+                    h=h
+                )
+            )
+ 
+            change_id += 1
+ 
+        return result, changes

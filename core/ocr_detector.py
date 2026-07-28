@@ -9,23 +9,32 @@ class OCRDetector:
             r"C:\Program Files\Tesseract-OCR\tesseract.exe"
         )
  
-    def _read(self, image):
+    def _preprocess(self, image):
+        """OCR 성능 향상을 위한 전처리"""
  
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
  
-        gray = cv2.medianBlur(gray, 3)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
  
-        _, binary = cv2.threshold(
+        binary = cv2.adaptiveThreshold(
             gray,
-            180,
             255,
-            cv2.THRESH_BINARY
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            10
         )
  
+        return binary
+ 
+    def _read(self, image):
+ 
+        processed = self._preprocess(image)
+ 
         text = pytesseract.image_to_string(
-            binary,
+            processed,
             lang="eng",
-            config="--psm 6"
+            config="--oem 3 --psm 6"
         )
  
         return text.strip()
