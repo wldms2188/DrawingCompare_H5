@@ -19,3 +19,6 @@ class ChangeInfo:
  
     change_type: str = ""
     page: int = 1
+    
+    before_image_path: str = ""
+    after_image_path: str = ""
