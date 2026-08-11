@@ -1,20 +1,34 @@
 from pathlib import Path
+from types import SimpleNamespace
  
-BASE_DIR = Path(__file__).parent
  
-INPUT_DIR = BASE_DIR / "input"
-OUTPUT_DIR = BASE_DIR / "output"
-CAPTURE_DIR = BASE_DIR / "capture"
-TEMP_DIR = BASE_DIR / "temp"
-LOG_DIR = BASE_DIR / "logs"
-TEMPLATE_DIR = BASE_DIR / "template"
+BASE_DIR = Path(__file__).resolve().parent
  
-SUPPORTED_FILES = [".pdf"]
  
-DPI = 300
+config = SimpleNamespace(
  
-CAPTURE_MARGIN = 40
+    pdf=SimpleNamespace(
+        dpi=200,
+    ),
  
-IMAGE_DIFF_THRESHOLD = 20
+    image=SimpleNamespace(
+        max_image_size=3000,
+        min_image_size=500,
+        denoise=True,
+    ),
  
-OCR_LANGUAGE = "kor+eng"
+    align=SimpleNamespace(
+        use_orb=True,
+        orb_features=5000,
+        use_akaze=True,
+    ),
+ 
+    project=SimpleNamespace(
+        recursive_search=True,
+        output_folder=str(BASE_DIR / "output"),
+    ),
+)
+ 
+ 
+CONFIG = config
+ 
