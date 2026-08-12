@@ -5,7 +5,7 @@ from types import SimpleNamespace
 BASE_DIR = Path(__file__).resolve().parent
  
  
-config = SimpleNamespace(
+CONFIG = SimpleNamespace(
  
     pdf=SimpleNamespace(
         dpi=200,
@@ -26,9 +26,15 @@ config = SimpleNamespace(
     project=SimpleNamespace(
         recursive_search=True,
         output_folder=str(BASE_DIR / "output"),
+ 
+        auto_align=True,
+        auto_file_match=True,
+        auto_page_match=True,
+    ),
+ 
+    change=SimpleNamespace(
+        pixel_threshold=30,
+        minimum_area=20,
+        merge_distance=10,
     ),
 )
- 
- 
-CONFIG = config
- 
