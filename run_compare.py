@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
  
-from core.image_loader import PDFImageLoader
+from core.image_loader import ImageLoader
 from core.auto_align import AutoAlign
 from core.change_detector import ChangeDetector
 from core.cropper import Cropper
@@ -13,7 +13,7 @@ def main():
  
     print("===== DrawingCompare H5 =====")
  
-    loader = PDFImageLoader(dpi=300)
+    loader = ImageLoader(dpi=300)
     aligner = AutoAlign()
     detector = ChangeDetector()
     cropper = Cropper()
