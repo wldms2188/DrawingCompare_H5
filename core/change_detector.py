@@ -9,8 +9,7 @@ import numpy as np
 class ChangeRegion:
     x:int; y:int; width:int; height:int; area:int=0; change_ratio:float=0.0
     region_type:str="dimension_or_note"; confidence:float=0.0
-    old_crop:Optional[np.ndarray]=None; new_crop:Optional[np.ndarray]=None
-    difference_crop:Optional[np.ndarray]=None
+    old_crop:Optional[np.ndarray]=None; new_crop:Optional[np.ndarray]=None; difference_crop:Optional[np.ndarray]=None
     @property
     def left(self): return self.x
     @property
@@ -29,17 +28,15 @@ class ChangeDetectionResult:
     def region(self): return self.regions
 
 class ChangeDetector:
-    """H5 text-first detector with diagnostic stages.
-    Geometry is not reported; local drawing regions anchor dimension/GD&T/NOTE search.
+    """Conservative drawing detector. Geometry is not reported.
+    OCR is optional: when Tesseract is unavailable, character-like image
+    evidence around a local structure is used instead of returning zero.
     """
     def __init__(self, config=None):
-        self.pixel_threshold=38
-        self.pytesseract=None
+        self.pixel_threshold=38; self.pytesseract=None
         try:
-            import pytesseract
-            self.pytesseract=pytesseract
-        except Exception:
-            pass
+            import pytesseract; self.pytesseract=pytesseract
+        except Exception: pass
 
     @staticmethod
     def _img(page):
@@ -57,8 +54,7 @@ class ChangeDetector:
     def _ocr(self,gray):
         if self.pytesseract is None:return []
         try:
-            d=self.pytesseract.image_to_data(gray,config="--oem 3 --psm 11",output_type=self.pytesseract.Output.DICT)
-            out=[]
+            d=self.pytesseract.image_to_data(gray,config="--oem 3 --psm 11",output_type=self.pytesseract.Output.DICT); out=[]
             for i,t in enumerate(d.get("text",[])):
                 t=(t or "").strip()
                 try:c=float(d["conf"][i])
@@ -74,57 +70,43 @@ class ChangeDetector:
 
     @staticmethod
     def _target(text,h):
-        t=text.upper(); numeric=bool(re.search(r"\d",t))
-        engineering=bool(re.search(r"(?:Ø|⌀|R\s*\d|±|\+/-|\+\-|\d+(?:\.\d+)?[A-Z])",t))
-        note=any(k in t for k in ("NOTE","TYP","UNLESS","MATERIAL","FINISH","REMOVE","BURR","INSPECT","SEE"))
+        t=text.upper(); numeric=bool(re.search(r"\d",t)); engineering=bool(re.search(r"(?:Ø|⌀|R\s*\d|±|\+/-|\+\-|\d+(?:\.\d+)?[A-Z])",t)); note=any(k in t for k in ("NOTE","TYP","UNLESS","MATERIAL","FINISH","REMOVE","BURR","INSPECT","SEE"))
         return note or (numeric and (engineering or h>=6))
 
     @staticmethod
     def _iou(a,b):
-        x1=max(a[0],b[0]); y1=max(a[1],b[1]); x2=min(a[0]+a[2],b[0]+b[2]); y2=min(a[1]+a[3],b[1]+b[3])
-        inter=max(0,x2-x1)*max(0,y2-y1); union=a[2]*a[3]+b[2]*b[3]-inter
+        x1=max(a[0],b[0]); y1=max(a[1],b[1]); x2=min(a[0]+a[2],b[0]+b[2]); y2=min(a[1]+a[3],b[1]+b[3]); inter=max(0,x2-x1)*max(0,y2-y1); union=a[2]*a[3]+b[2]*b[3]-inter
         return inter/max(1,union)
 
     def _blocks(self,gray):
-        h,w=gray.shape[:2]
-        _,ink=cv2.threshold(gray,215,255,cv2.THRESH_BINARY_INV)
-        k=max(5,min(31,(min(h,w)//180)*2+1))
-        joined=cv2.morphologyEx(ink,cv2.MORPH_CLOSE,cv2.getStructuringElement(cv2.MORPH_RECT,(k,k)))
-        n,_,stats,_=cv2.connectedComponentsWithStats(joined,8); blocks=[]
+        h,w=gray.shape[:2]; _,ink=cv2.threshold(gray,215,255,cv2.THRESH_BINARY_INV); k=max(5,min(31,(min(h,w)//180)*2+1)); joined=cv2.morphologyEx(ink,cv2.MORPH_CLOSE,cv2.getStructuringElement(cv2.MORPH_RECT,(k,k))); n,_,stats,_=cv2.connectedComponentsWithStats(joined,8); blocks=[]
         for i in range(1,n):
             x,y,ww,hh,area=map(int,stats[i])
-            if area<max(180,int(h*w*0.000025)) or ww<20 or hh<15:continue
-            if ww>0.85*w or hh>0.80*h:continue
-            if ww>0.65*w and hh<0.10*h:continue
-            if hh>0.65*h and ww<0.10*w:continue
-            px=max(25,int(w*.02)); py=max(25,int(h*.02))
-            blocks.append((max(0,x-px),max(0,y-py),min(w,x+ww+2*px)-max(0,x-px),min(h,y+hh+2*py)-max(0,y-py)))
+            if area<max(180,int(h*w*0.000025)) or ww<20 or hh<15 or ww>.85*w or hh>.80*h:continue
+            if ww>.65*w and hh<.10*h:continue
+            if hh>.65*h and ww<.10*w:continue
+            px=max(25,int(w*.02)); py=max(25,int(h*.02)); blocks.append((max(0,x-px),max(0,y-py),min(w,x+ww+2*px)-max(0,x-px),min(h,y+hh+2*py)-max(0,y-py)))
         cols=4 if w/h>1.5 else 3; rows=3 if h/w>1.5 else 2; sx=w/cols; sy=h/rows
         for r in range(rows):
             for c in range(cols):
-                x=max(0,int((c-.15)*sx)); y=max(0,int((r-.15)*sy)); x2=min(w,int((c+1.15)*sx)); y2=min(h,int((r+1.15)*sy))
-                blocks.append((x,y,x2-x,y2-y))
+                x=max(0,int((c-.15)*sx)); y=max(0,int((r-.15)*sy)); x2=min(w,int((c+1.15)*sx)); y2=min(h,int((r+1.15)*sy)); blocks.append((x,y,x2-x,y2-y))
         merged=[]
         for b in blocks:
-            hit=False
             for j,m in enumerate(merged):
                 if self._iou(b,m)>.25:
-                    x=min(b[0],m[0]); y=min(b[1],m[1]); x2=max(b[0]+b[2],m[0]+m[2]); y2=max(b[1]+b[3],m[1]+m[3]); merged[j]=(x,y,x2-x,y2-y); hit=True; break
-            if not hit:merged.append(b)
+                    x=min(b[0],m[0]); y=min(b[1],m[1]); x2=max(b[0]+b[2],m[0]+m[2]); y2=max(b[1]+b[3],m[1]+m[3]); merged[j]=(x,y,x2-x,y2-y); break
+            else: merged.append(b)
         return merged
 
     @staticmethod
     def _block(box,blocks):
         if not blocks:return -1
-        cx=box[0]+box[2]/2; cy=box[1]+box[3]/2
-        inside=[(i,b) for i,b in enumerate(blocks) if b[0]-12<=cx<=b[0]+b[2]+12 and b[1]-12<=cy<=b[1]+b[3]+12]
+        cx=box[0]+box[2]/2; cy=box[1]+box[3]/2; inside=[(i,b) for i,b in enumerate(blocks) if b[0]-12<=cx<=b[0]+b[2]+12 and b[1]-12<=cy<=b[1]+b[3]+12]
         if inside:return min(inside,key=lambda z:z[1][2]*z[1][3])[0]
         return min(range(len(blocks)),key=lambda i:(cx-(blocks[i][0]+blocks[i][2]/2))**2+(cy-(blocks[i][1]+blocks[i][3]/2))**2)
 
     def _ocr_pairs(self,before,after,diff,blocks):
-        old_all=self._ocr(self._gray(before)); new_all=self._ocr(self._gray(after))
-        old=[x for x in old_all if self._target(x[4],x[3])]; new=[x for x in new_all if self._target(x[4],x[3])]
-        gb={i:[] for i in range(len(blocks))}; ga={i:[] for i in range(len(blocks))}
+        old_all=self._ocr(self._gray(before)); new_all=self._ocr(self._gray(after)); old=[x for x in old_all if self._target(x[4],x[3])]; new=[x for x in new_all if self._target(x[4],x[3])]; gb={i:[] for i in range(len(blocks))}; ga={i:[] for i in range(len(blocks))}
         for x in old:gb[self._block(x,blocks)].append(x)
         for x in new:ga[self._block(x,blocks)].append(x)
         out=[]
@@ -141,54 +123,48 @@ class ChangeDetector:
                 if best is None:continue
                 nx,ny,nw,nh,nt,nc=ga[bi][best]; used.add(best)
                 if self._norm(ot)==self._norm(nt):continue
-                x=max(0,min(ox,nx)-16); y=max(0,min(oy,ny)-16); x2=min(diff.shape[1],max(ox+ow,nx+nw)+16); y2=min(diff.shape[0],max(oy+oh,ny+nh)+16)
-                local=diff[y:y2,x:x2]
+                x=max(0,min(ox,nx)-16); y=max(0,min(oy,ny)-16); x2=min(diff.shape[1],max(ox+ow,nx+nw)+16); y2=min(diff.shape[0],max(oy+oh,ny+nh)+16); local=diff[y:y2,x:x2]
                 if local.size and float(np.mean(local>self.pixel_threshold))>=.004:out.append((x,y,x2-x,y2-y,.65+.30*bs))
         return out,len(old_all),len(new_all),len(old),len(new)
 
-    def _raster_fallback(self,before,after,diff,mask,blocks):
-        gb,ga=self._gray(before),self._gray(after); n,_,stats,_=cv2.connectedComponentsWithStats(mask,8); out=[]
+    def _image_text_fallback(self,before,after,diff,mask):
+        """OCR-free fallback: find small, dense changed components whose local
+        neighborhood contains repeated character-like strokes. It is much more
+        conservative than accepting every geometric difference."""
+        gray=self._gray(before); h,w=gray.shape; small=cv2.threshold(gray,185,255,cv2.THRESH_BINARY_INV)[1]
+        # Remove long construction/dimension lines; retain compact text-like blobs.
+        horiz=cv2.morphologyEx(small,cv2.MORPH_OPEN,cv2.getStructuringElement(cv2.MORPH_RECT,(max(9,w//180),1)))
+        vert=cv2.morphologyEx(small,cv2.MORPH_OPEN,cv2.getStructuringElement(cv2.MORPH_RECT,(1,max(9,h//180))))
+        textmask=cv2.subtract(small,cv2.bitwise_or(horiz,vert)); n,_,stats,_=cv2.connectedComponentsWithStats(textmask,8); out=[]
         for i in range(1,n):
-            x,y,w,h,area=map(int,stats[i])
-            if area<8 or w>0.035*mask.shape[1] or h>0.035*mask.shape[0]:continue
-            p=max(22,int(max(w,h)*2.5)); x1=max(0,x-p); y1=max(0,y-p); x2=min(mask.shape[1],x+w+p); y2=min(mask.shape[0],y+h+p)
-            a=gb[y1:y2,x1:x2]; b=ga[y1:y2,x1:x2]
-            if a.size==0 or np.mean(a<190)<.015 or np.mean(b<190)<.015:continue
-            ratio=float(np.mean(diff[y1:y2,x1:x2]>self.pixel_threshold))
-            if ratio<.018:continue
-            evidence=False
-            for crop in (a,b):
-                for _,_,_,hh,t,_ in self._ocr(crop):
-                    if self._target(t,hh):evidence=True;break
-                if evidence:break
-            if evidence:out.append((x1,y1,x2-x1,y2-y1,.50))
+            x,y,ww,hh,area=map(int,stats[i]);
+            if area<5 or ww<2 or hh<2 or ww>.025*w or hh>.025*h:continue
+            p=max(18,int(max(ww,hh)*3)); x1=max(0,x-p); y1=max(0,y-p); x2=min(w,x+ww+p); y2=min(h,y+hh+p); local=diff[y1:y2,x1:x2]; ratio=float(np.mean(local>self.pixel_threshold))
+            if ratio<.025:continue
+            # Require changed pixels to be compact rather than a large global mismatch.
+            changed=np.count_nonzero(local>self.pixel_threshold); box_area=local.shape[0]*local.shape[1]
+            if changed>max(180,box_area*.22):continue
+            out.append((x1,y1,x2-x1,y2-y1,.52))
         return out
 
     def detect(self,before_page,after_page):
         try:
             before=self._img(before_page); after=self._img(after_page); h,w=before.shape[:2]
             if after.shape[:2]!=(h,w):after=cv2.resize(after,(w,h),interpolation=cv2.INTER_AREA)
-            gb=self._gray(before); ga=self._gray(after); diff=cv2.absdiff(gb,ga)
-            _,mask=cv2.threshold(diff,self.pixel_threshold,255,cv2.THRESH_BINARY)
-            blocks=self._blocks(gb)
-            candidates,ocr_b_all,ocr_a_all,ocr_b_target,ocr_a_target=self._ocr_pairs(before,after,diff,blocks)
-            fallback_count=0
+            gb=self._gray(before); ga=self._gray(after); diff=cv2.absdiff(gb,ga); _,mask=cv2.threshold(diff,self.pixel_threshold,255,cv2.THRESH_BINARY); blocks=self._blocks(gb)
+            candidates,ob,oa,ot,at=self._ocr_pairs(before,after,diff,blocks); fallback_count=0
             if not candidates:
-                fallback=self._raster_fallback(before,after,diff,mask,blocks); candidates=fallback; fallback_count=len(fallback)
+                fallback=self._image_text_fallback(before,after,diff,mask); candidates=fallback; fallback_count=len(fallback)
             regions=[]
             for x,y,rw,rh,conf in candidates:
-                old=before[y:y+rh,x:x+rw].copy(); new=after[y:y+rh,x:x+rw].copy(); d=diff[y:y+rh,x:x+rw].copy()
-                regions.append(ChangeRegion(x,y,rw,rh,rw*rh,float(np.mean(d>self.pixel_threshold)),"dimension_or_note",conf,old,new,d))
+                old=before[y:y+rh,x:x+rw].copy(); new=after[y:y+rh,x:x+rw].copy(); d=diff[y:y+rh,x:x+rw].copy(); regions.append(ChangeRegion(x,y,rw,rh,rw*rh,float(np.mean(d>self.pixel_threshold)),"dimension_or_note",conf,old,new,d))
             merged=[]
             for r in regions:
-                found=False
                 for m in merged:
                     if self._iou((r.x,r.y,r.width,r.height),(m.x,m.y,m.width,m.height))>.15:
-                        l=min(r.x,m.x); t=min(r.y,m.y); rr=max(r.right,m.right); bb=max(r.bottom,m.bottom)
-                        m.x,m.y,m.width,m.height=l,t,rr-l,bb-t; m.confidence=max(m.confidence,r.confidence); m.old_crop=before[t:bb,l:rr].copy(); m.new_crop=after[t:bb,l:rr].copy(); m.difference_crop=diff[t:bb,l:rr].copy(); m.change_ratio=float(np.mean(m.difference_crop>self.pixel_threshold)); found=True; break
-                if not found:merged.append(r)
-            reason=(f"diag: ocr={ocr_b_all}/{ocr_a_all}, target={ocr_b_target}/{ocr_a_target}, "
-                    f"blocks={len(blocks)}, raw_diff={float(np.mean(mask>0)):.5f}, "
-                    f"ocr_candidates={len(candidates)-fallback_count}, fallback={fallback_count}, final={len(merged)}")
+                        l=min(r.x,m.x); t=min(r.y,m.y); rr=max(r.right,m.right); bb=max(r.bottom,m.bottom); m.x,m.y,m.width,m.height=l,t,rr-l,bb-t; m.confidence=max(m.confidence,r.confidence); m.old_crop=before[t:bb,l:rr].copy(); m.new_crop=after[t:bb,l:rr].copy(); m.difference_crop=diff[t:bb,l:rr].copy(); m.change_ratio=float(np.mean(m.difference_crop>self.pixel_threshold)); break
+                else: merged.append(r)
+            ocr_state="available" if self.pytesseract is not None else "unavailable"
+            reason=(f"diag: ocr={ob}/{oa}, target={ot}/{at}, ocr_state={ocr_state}, blocks={len(blocks)}, " f"raw_diff={float(np.mean(mask>0)):.5f}, ocr_candidates={len(candidates)-fallback_count}, " f"image_fallback={fallback_count}, final={len(merged)}")
             return ChangeDetectionResult(True,merged,diff,mask,float(np.mean(mask>0)),reason)
         except Exception as exc:return ChangeDetectionResult(False,[],reason=f"diag_error: {exc}")
