@@ -36,7 +36,6 @@ class ChangeDetectionResult:
     def region(self): return self.regions
 
 class ChangeDetector:
-    """Compare pages in one coordinate system and preserve semantic change types."""
     def __init__(self, config=None):
         self.builder = SemanticRegionBuilder()
         self.pixel_threshold = 30
@@ -65,7 +64,6 @@ class ChangeDetector:
     @staticmethod
     def _class(text):
         u = str(text).strip().upper()
-        # Diameter/radius/linear dimension tokens are dimensions, not GD&T.
         if re.fullmatch(r'(?:R|M|D)?\s*(?:Ø|⌀)\s*\d+(?:\.\d+)?', u): return 'DIMENSION'
         if re.fullmatch(r'(?:R|M|D)?\s*\d+(?:\.\d+)?(?:\s*[A-Z°]+)?', u) or re.fullmatch(r'\d+/\d+', u) or '±' in u: return 'DIMENSION'
         if re.search(r'POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC|⌖|⌯|⏥|⌒|∥|⊥', u): return 'GDT'
@@ -77,14 +75,26 @@ class ChangeDetector:
         return {'GDT':'gdt_change','DIMENSION':'dimension_change','NOTE':'note_change'}.get(cls, 'text_change')
 
     def _words(self, page):
+        """Return normalized PDF words, classifying each word using its full line context."""
         try:
             import fitz
-            doc = fitz.open(page.pdf_path); p = doc.load_page(int(page.page_index)); r = p.rect
+            doc = fitz.open(page.pdf_path)
+            p = doc.load_page(int(page.page_index)); r = p.rect
+            raw = p.get_text('words')
+            lines={}
+            for z in raw:
+                if len(z) < 8: continue
+                x0,y0,x1,y1,text,block_no,line_no,word_no = z[:8]
+                key=(block_no,line_no)
+                lines.setdefault(key,[]).append(str(text).strip())
             out=[]
-            for z in p.get_text('words'):
-                x0,y0,x1,y1,text,*_ = z; text=str(text).strip()
-                if text:
-                    out.append({'text':text,'x':x0/r.width,'y':y0/r.height,'w':(x1-x0)/r.width,'h':(y1-y0)/r.height,'class':self._class(text)})
+            for z in raw:
+                if len(z) < 8: continue
+                x0,y0,x1,y1,text,block_no,line_no,word_no = z[:8]
+                text=str(text).strip()
+                if not text: continue
+                context=' '.join(lines.get((block_no,line_no),[text]))
+                out.append({'text':text,'context':context,'x':x0/r.width,'y':y0/r.height,'w':(x1-x0)/r.width,'h':(y1-y0)/r.height,'class':self._class(context)})
             doc.close(); return out
         except Exception:
             return []
@@ -98,8 +108,7 @@ class ChangeDetector:
         matches=cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(db,da,k=2)
         good=[m for m,n in matches if m.distance < .75*n.distance]
         if len(good)<8: return None
-        src=np.float32([kb[m.queryIdx].pt for m in good]).reshape(-1,1,2)
-        dst=np.float32([ka[m.trainIdx].pt for m in good]).reshape(-1,1,2)
+        src=np.float32([kb[m.queryIdx].pt for m in good]).reshape(-1,1,2); dst=np.float32([ka[m.trainIdx].pt for m in good]).reshape(-1,1,2)
         H,_=cv2.findHomography(dst,src,cv2.RANSAC,4.0)
         return H
 
@@ -138,7 +147,7 @@ class ChangeDetector:
             view=self._img(aligned_after) if aligned_after is not None else after_original
             H0,W0=before.shape[:2]; HV,WV=view.shape[:2]
             old=self._words(before_page); new=self._words(after_page)
-            H=self._find_homography(before,after_original)
+            H=self._find_homography(view,after_original) if aligned_after is not None else self._find_homography(before,after_original)
             mapped=[]
             if H is not None:
                 for q in new:
@@ -162,7 +171,7 @@ class ChangeDetector:
             for o,n,score in pairs:
                 if self._norm_text(o['text']) == self._norm_text(n['text']): continue
                 ob=self._word_box(o); nb=self._word_box(n); x=min(ob.x,nb.x);y=min(ob.y,nb.y);xx=max(ob.x+ob.w,nb.x+nb.w);yy=max(ob.y+ob.h,nb.y+nb.h)
-                box=Box(x,y,xx-x,yy-y).pad(5,WV,HV); cls=self._class(o['text']); kind=self._kind(cls)
+                box=Box(x,y,xx-x,yy-y).pad(5,WV,HV); cls=self._class(o.get('context',o['text'])); kind=self._kind(cls)
                 regions.append(ChangeRegion(box.x,box.y,box.w,box.h,box.w*box.h,0.0,kind,max(.5,1-score/max(1,maxd)),self._crop(before,ob),self._crop(view,box),None,o['text'],n['text'],kind))
             pixels=self._pixel_regions(before,view)
             for pb in pixels:
