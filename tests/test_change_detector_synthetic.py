@@ -19,14 +19,20 @@ def test_text_normalization_and_classification():
     assert d._kind('GDT') == 'gdt_change'
 
 
+def test_semantic_context_wins_for_note_and_gdt_values():
+    d = ChangeDetector()
+    assert d._class_token_context('AL6061', 'MATERIAL: AL6061') == 'NOTE'
+    assert d._class_token_context('0.05', 'POSITION 0.05 | A') == 'GDT'
+
+
 def test_pixel_region_detector_catches_small_local_geometry_change():
     d = ChangeDetector()
     before = np.full((400, 400), 255, np.uint8)
     after = before.copy()
     after[180:205, 180:215] = 0
     regions = d._pixel_regions(before, after)
-    assert regions, 'local synthetic geometry change was not detected'
-    assert any(r.x < 180 + 20 and r.right > 180 for r in regions)
+    assert regions
+    assert any(r.x < 200 and r.right > 180 for r in regions)
 
 
 def test_no_change_returns_no_text_regions():
