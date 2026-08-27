@@ -10,6 +10,7 @@ from config import BEFORE_DIR, AFTER_DIR, OUTPUT_DIR
 from core.image_loader import ImageLoader
 from core.auto_align import AutoAlign
 from core.change_detector import ChangeDetector
+from core.page_matcher import PageMatcher
 
 class DrawingCompareApp(tk.Tk):
     def __init__(self):
@@ -41,19 +42,20 @@ class DrawingCompareApp(tk.Tk):
             output_dir.mkdir(parents=True,exist_ok=True); loader=ImageLoader(); before_docs=loader.load_folder(before_dir); after_docs=loader.load_folder(after_dir)
             if not before_docs or not after_docs: raise RuntimeError("Before 또는 After 폴더에 읽을 수 있는 PDF가 없습니다.")
             self.write_log(f"Before PDF {len(before_docs)}개 / After PDF {len(after_docs)}개")
-            pairs=self._match_documents(before_docs,after_docs); aligner,detector=AutoAlign(),ChangeDetector(); rows=[]; capture_dir=output_dir/"captures"; capture_dir.mkdir(parents=True,exist_ok=True)
+            pairs=self._match_documents(before_docs,after_docs); aligner,detector,page_matcher=AutoAlign(),ChangeDetector(),PageMatcher(); rows=[]; capture_dir=output_dir/"captures"; capture_dir.mkdir(parents=True,exist_ok=True)
             for pair_no,(bd,ad) in enumerate(pairs,1):
-                page_pairs=self._match_pages(bd.pages,ad.pages); self.write_log(f"문서 {pair_no}: {bd.filename} ↔ {ad.filename}, {len(page_pairs)}페이지")
-                for bp,ap in page_pairs:
+                page_matches=page_matcher.match_pages(bd,ad); self.write_log(f"문서 {pair_no}: {bd.filename} ↔ {ad.filename}, 페이지 후보 {len(page_matches)}개")
+                for pm in page_matches:
+                    if pm.status == "NO_MATCH":
+                        self.write_log(f"페이지 보류: B{pm.before_page.page_index+1} ↔ A{pm.after_page.page_index+1}, score={pm.score:.3f}"); continue
+                    bp,ap=pm.before_page,pm.after_page
                     self.status.set(f"비교 중... {bd.filename} p{bp.page_index+1}")
                     try: aligned=aligner.align(bp.image,ap.image)
                     except Exception as exc: self.write_log(f"정렬 경고: {exc}"); aligned=ap.image
-                    # Keep the original PageImage objects for native PDF text lookup,
-                    # while passing the aligned raster separately for pixel validation.
                     result=detector.detect(bp,ap,aligned_after=aligned); self.write_log(f"검출 진단 p{bp.page_index+1}: {result.reason}")
                     for region_no,region in enumerate(result.regions,1):
                         stem=f"D{pair_no:02d}_P{bp.page_index+1:03d}_R{region_no:03d}"; old_path,new_path=capture_dir/f"{stem}_before.png",capture_dir/f"{stem}_after.png"; cv2.imwrite(str(old_path),self._to_bgr(region.old_crop)); cv2.imwrite(str(new_path),self._to_bgr(region.new_crop))
-                        rows.append({"No":len(rows)+1,"Before PDF":bd.filename,"After PDF":ad.filename,"Before Page":bp.page_index+1,"After Page":ap.page_index+1,"Type":region.region_type,"Confidence":round(region.confidence,3),"X":region.x,"Y":region.y,"Width":region.width,"Height":region.height,"Change Ratio":round(region.change_ratio,4),"Before Image":str(old_path),"After Image":str(new_path)})
+                        rows.append({"No":len(rows)+1,"Before PDF":bd.filename,"After PDF":ad.filename,"Before Page":bp.page_index+1,"After Page":ap.page_index+1,"Type":region.region_type,"Confidence":round(region.confidence,3),"X":region.x,"Y":region.y,"Width":region.width,"Height":region.height,"Change Ratio":round(region.change_ratio,4),"Before Image":str(old_path),"After Image":str(new_path),"Before Text":region.old_text,"After Text":region.new_text})
             report=output_dir/"DrawingCompare_H5_Result.xlsx"; self._write_excel(rows,report); self.after(0,lambda:self._finished(report,len(rows)))
         except Exception as exc: self.write_log(f"ERROR: {exc}"); self.after(0,lambda e=str(exc):self._failed(e))
     @staticmethod
@@ -71,25 +73,16 @@ class DrawingCompareApp(tk.Tk):
             best=min(remaining,key=lambda ad:(0 if Path(bd.filename).stem.lower()==Path(ad.filename).stem.lower() else 10)+abs(bd.page_count-ad.page_count)); pairs.append((bd,best)); remaining.remove(best)
         return pairs
     @staticmethod
-    def _match_pages(before_pages,after_pages):
-        remaining=list(after_pages); result=[]
-        for bp in before_pages:
-            if not remaining:break
-            area1=max(bp.width*bp.height,1)
-            def score(ap): return abs(bp.aspect_ratio-ap.aspect_ratio)+abs(area1-max(ap.width*ap.height,1))/area1
-            ap=min(remaining,key=score); result.append((bp,ap)); remaining.remove(ap)
-        return result
-    @staticmethod
     def _write_excel(rows,path):
         from openpyxl import Workbook
         from openpyxl.styles import Font,Alignment
         from openpyxl.drawing.image import Image as XLImage
-        wb=Workbook(); ws=wb.active; ws.title="Drawing Compare"; headers=["No","Before PDF","After PDF","Before Page","After Page","Type","Confidence","X","Y","Width","Height","Change Ratio","Before Image","After Image"]
+        wb=Workbook(); ws=wb.active; ws.title="Drawing Compare"; headers=["No","Before PDF","After PDF","Before Page","After Page","Type","Confidence","X","Y","Width","Height","Change Ratio","Before Text","After Text","Before Image","After Image"]
         for c,h in enumerate(headers,1):ws.cell(1,c,h).font=Font(bold=True); ws.cell(1,c).alignment=Alignment(horizontal="center")
         for r,item in enumerate(rows,2):
             for c,h in enumerate(headers,1):ws.cell(r,c,item.get(h,""))
             ws.row_dimensions[r].height=90
-            for col,key in ((13,"Before Image"),(14,"After Image")):
+            for col,key in ((15,"Before Image"),(16,"After Image")):
                 p=item.get(key)
                 if p and Path(p).exists():img=XLImage(p); img.width=150; img.height=80; ws.add_image(img,f"{chr(64+col)}{r}")
         wb.save(path)
