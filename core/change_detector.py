@@ -65,8 +65,10 @@ class ChangeDetector:
     @staticmethod
     def _class(text):
         u = str(text).strip().upper()
-        if re.search(r'POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC|⌀|Ø|⌖|⌯|⏥|⌒|∥|⊥', u): return 'GDT'
-        if re.fullmatch(r'(?:R|M|D)?\s*(?:Ø|⌀)?\d+(?:\.\d+)?(?:\s*[A-Z°]+)?', u) or re.fullmatch(r'\d+/\d+', u) or '±' in u: return 'DIMENSION'
+        # Diameter/radius/linear dimension tokens are dimensions, not GD&T.
+        if re.fullmatch(r'(?:R|M|D)?\s*(?:Ø|⌀)\s*\d+(?:\.\d+)?', u): return 'DIMENSION'
+        if re.fullmatch(r'(?:R|M|D)?\s*\d+(?:\.\d+)?(?:\s*[A-Z°]+)?', u) or re.fullmatch(r'\d+/\d+', u) or '±' in u: return 'DIMENSION'
+        if re.search(r'POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC|⌖|⌯|⏥|⌒|∥|⊥', u): return 'GDT'
         if re.search(r'NOTE|NOTES|UNLESS|MATERIAL|FINISH|REMOVE|BURR|INSPECT|SEE|REMARK|COMMENT', u): return 'NOTE'
         return 'TEXT'
 
@@ -146,8 +148,7 @@ class ChangeDetector:
             sx=WV/max(1,W0); sy=HV/max(1,H0)
             mapped=[{**q,'x':q['x']*sx,'y':q['y']*sy,'w':q['w']*sx,'h':q['h']*sy} for q in mapped]
             oldpx=[{**q,'x':q['x']*W0,'y':q['y']*H0,'w':q['w']*W0,'h':q['h']*H0} for q in old]
-            candidates=[]
-            maxd=max(50,min(WV,HV)*.025)
+            candidates=[]; maxd=max(50,min(WV,HV)*.025)
             for oi,o in enumerate(oldpx):
                 for ni,n in enumerate(mapped):
                     d=float(np.hypot(o['x']+o['w']/2-n['x']-n['w']/2,o['y']+o['h']/2-n['y']-n['h']/2))
