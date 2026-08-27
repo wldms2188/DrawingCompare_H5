@@ -12,8 +12,12 @@ LOG_DIR = str(BASE_DIR / "logs")
 TEMPLATE_DIR = str(BASE_DIR / "templates")
 
 CONFIG = SimpleNamespace(
-    pdf=SimpleNamespace(dpi=200),
-    image=SimpleNamespace(max_image_size=3000, min_image_size=500, denoise=True),
+    # PDF is vector data, so render at high resolution. The original PDF is
+    # never rasterized down to a small preview for actual text comparison.
+    pdf=SimpleNamespace(dpi=400),
+    # Keep analysis images large enough for small dimension/GD&T characters.
+    # Feature matching may create its own smaller copy when needed.
+    image=SimpleNamespace(max_image_size=6000, min_image_size=1000, denoise=False),
     align=SimpleNamespace(use_orb=True, orb_features=5000, use_akaze=True),
     project=SimpleNamespace(
         recursive_search=True,
