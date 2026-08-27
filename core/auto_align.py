@@ -1,9 +1,20 @@
 from __future__ import annotations
+from dataclasses import dataclass
 import cv2
 import numpy as np
 
+@dataclass
+class AlignmentResult:
+    image: np.ndarray
+    matrix: np.ndarray | None
+    method: str
+    success: bool
+    scale: float = 1.0
+    rotation: float = 0.0
+    valid_ratio: float = 1.0
+
 class AutoAlign:
-    """Engineering-drawing alignment. Maps After into Before coordinates."""
+    """Maps After into Before coordinates and exposes the exact transform used."""
     def __init__(self,max_rotation_deg:float=12.0): self.max_rotation_deg=float(max_rotation_deg)
     @staticmethod
     def _gray(image):
@@ -36,18 +47,24 @@ class AutoAlign:
     def align(self,before_img,after_img):
         before=np.asarray(before_img); after=np.asarray(after_img); h,w=before.shape[:2]
         if before.size==0 or after.size==0:raise ValueError("Before/After 이미지가 비어 있습니다.")
-        if h<50 or w<50:return after.copy()
+        if h<50 or w<50:return AlignmentResult(after.copy(),None,"NONE",False)
         bg=self._gray(before); ag=self._gray(after)
         if ag.shape!=bg.shape: after=cv2.resize(after,(w,h),interpolation=cv2.INTER_AREA); ag=self._gray(after)
         try:
             result=self._orb_estimate(bg,ag); method="ORB"
             if result is None:result=self._ecc_estimate(bg,ag); method="ECC"
-            if result is None:print("자동 정렬 보류 : 신뢰할 수 있는 변환을 찾지 못했습니다."); return after.copy()
+            if result is None:
+                print("자동 정렬 보류 : 신뢰할 수 있는 변환을 찾지 못했습니다.")
+                return AlignmentResult(after.copy(),None,"NONE",False)
             M,count,ratio,scale,rotation=result
             flags=cv2.INTER_LINEAR if method=="ORB" else (cv2.INTER_LINEAR|cv2.WARP_INVERSE_MAP)
             aligned=cv2.warpAffine(after,M,(w,h),flags=flags,borderMode=cv2.BORDER_CONSTANT,borderValue=255)
             valid=np.full((h,w),255,np.uint8); vflags=cv2.INTER_NEAREST if method=="ORB" else (cv2.INTER_NEAREST|cv2.WARP_INVERSE_MAP); valid=cv2.warpAffine(valid,M,(w,h),flags=vflags); valid_ratio=float(np.count_nonzero(valid))/max(1,w*h)
-            if valid_ratio<.70:print("자동 정렬 보류 : 유효 영역이 너무 많이 손실되었습니다."); return after.copy()
+            if valid_ratio<.70:
+                print("자동 정렬 보류 : 유효 영역이 너무 많이 손실되었습니다.")
+                return AlignmentResult(after.copy(),None,"NONE",False)
             print(f"자동 정렬 완료 : {method} scale={scale:.3f}, rotation={rotation:.2f}°, valid={valid_ratio:.2f}")
-            return aligned
-        except Exception as exc:print(f"자동 정렬 보류 : {exc}"); return after.copy()
+            return AlignmentResult(aligned,M,method,True,scale,rotation,valid_ratio)
+        except Exception as exc:
+            print(f"자동 정렬 보류 : {exc}")
+            return AlignmentResult(after.copy(),None,"NONE",False)
