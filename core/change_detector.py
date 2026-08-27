@@ -10,6 +10,14 @@ from .semantic_region_builder import SemanticRegionBuilder
 class Box:
     x: int; y: int; w: int; h: int
     def xyxy(self): return self.x, self.y, self.x + self.w, self.y + self.h
+    @property
+    def left(self): return self.x
+    @property
+    def top(self): return self.y
+    @property
+    def right(self): return self.x + self.w
+    @property
+    def bottom(self): return self.y + self.h
     def pad(self, p, W, H):
         p=int(p); x=max(0,self.x-p); y=max(0,self.y-p)
         return Box(x,y,max(1,min(W,self.x+self.w+p)-x),max(1,min(H,self.y+self.h+p)-y))
@@ -99,11 +107,8 @@ class ChangeDetector:
             before=self._img(before_page); after_original=self._img(after_page); view=self._img(aligned_after) if aligned_after is not None else after_original
             H0,W0=before.shape[:2]; HV,WV=view.shape[:2]; old=self._words(before_page); new=self._words(after_page); mapped=[]
             if alignment_matrix is not None:
-                M=np.asarray(alignment_matrix,dtype=np.float32).reshape(2,3)
-                mapped=[self._map_box(q,M,after_original.shape[1],after_original.shape[0]) for q in new]
-            else:
-                mapped=new
-            # The aligned image is already in Before pixel coordinates. Only normalize if dimensions differ.
+                M=np.asarray(alignment_matrix,dtype=np.float32).reshape(2,3); mapped=[self._map_box(q,M,after_original.shape[1],after_original.shape[0]) for q in new]
+            else:mapped=new
             sx=WV/max(1,W0); sy=HV/max(1,H0); mapped=[{**q,'x':q['x']*sx,'y':q['y']*sy,'w':q['w']*sx,'h':q['h']*sy} for q in mapped]
             oldpx=[{**q,'x':q['x']*W0,'y':q['y']*H0,'w':q['w']*W0,'h':q['h']*H0} for q in old]
             candidates=[]; maxd=max(50,min(WV,HV)*.025)
