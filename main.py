@@ -8,7 +8,7 @@ import numpy as np
 from version import APP_NAME, VERSION
 from config import BEFORE_DIR, AFTER_DIR, OUTPUT_DIR
 from core.image_loader import ImageLoader
-from core.auto_align import AutoAlign
+from core.auto_align import AutoAlign, AlignmentResult
 from core.change_detector import ChangeDetector
 from core.page_matcher import PageMatcher
 
@@ -17,14 +17,7 @@ class DrawingCompareApp(tk.Tk):
         super().__init__(); self.title(f"{APP_NAME} {VERSION}"); self.geometry("900x650"); self.minsize(760,560)
         self.before_dir=tk.StringVar(value=BEFORE_DIR); self.after_dir=tk.StringVar(value=AFTER_DIR); self.output_dir=tk.StringVar(value=OUTPUT_DIR); self.status=tk.StringVar(value="Before / After 폴더를 확인한 뒤 비교를 시작하세요."); self._build()
     def _build(self):
-        root=ttk.Frame(self,padding=18); root.pack(fill="both",expand=True)
-        ttk.Label(root,text=f"{APP_NAME} {VERSION}",font=("Segoe UI",20,"bold")).pack(anchor="w")
-        ttk.Label(root,text="Engineering Drawing PDF Compare",font=("Segoe UI",10)).pack(anchor="w",pady=(0,18))
-        box=ttk.LabelFrame(root,text="입력 / 출력",padding=12); box.pack(fill="x")
-        self._path_row(box,"Before",self.before_dir); self._path_row(box,"After",self.after_dir); self._path_row(box,"결과 폴더",self.output_dir)
-        self.run_btn=ttk.Button(root,text="도면 비교 시작",command=self.start); self.run_btn.pack(anchor="e",pady=14)
-        self.progress=ttk.Progressbar(root,mode="indeterminate"); self.progress.pack(fill="x",pady=(0,10)); ttk.Label(root,textvariable=self.status).pack(anchor="w")
-        logbox=ttk.LabelFrame(root,text="처리 로그",padding=8); logbox.pack(fill="both",expand=True,pady=(12,0)); self.log=tk.Text(logbox,wrap="word",state="disabled",font=("Consolas",9)); self.log.pack(side="left",fill="both",expand=True); scroll=ttk.Scrollbar(logbox,command=self.log.yview); scroll.pack(side="right",fill="y"); self.log.configure(yscrollcommand=scroll.set)
+        root=ttk.Frame(self,padding=18); root.pack(fill="both",expand=True); ttk.Label(root,text=f"{APP_NAME} {VERSION}",font=("Segoe UI",20,"bold")).pack(anchor="w"); ttk.Label(root,text="Engineering Drawing PDF Compare",font=("Segoe UI",10)).pack(anchor="w",pady=(0,18)); box=ttk.LabelFrame(root,text="입력 / 출력",padding=12); box.pack(fill="x"); self._path_row(box,"Before",self.before_dir); self._path_row(box,"After",self.after_dir); self._path_row(box,"결과 폴더",self.output_dir); self.run_btn=ttk.Button(root,text="도면 비교 시작",command=self.start); self.run_btn.pack(anchor="e",pady=14); self.progress=ttk.Progressbar(root,mode="indeterminate"); self.progress.pack(fill="x",pady=(0,10)); ttk.Label(root,textvariable=self.status).pack(anchor="w"); logbox=ttk.LabelFrame(root,text="처리 로그",padding=8); logbox.pack(fill="both",expand=True,pady=(12,0)); self.log=tk.Text(logbox,wrap="word",state="disabled",font=("Consolas",9)); self.log.pack(side="left",fill="both",expand=True); scroll=ttk.Scrollbar(logbox,command=self.log.yview); scroll.pack(side="right",fill="y"); self.log.configure(yscrollcommand=scroll.set)
     def _path_row(self,parent,label,variable):
         row=ttk.Frame(parent); row.pack(fill="x",pady=4); ttk.Label(row,text=label,width=10).pack(side="left"); ttk.Entry(row,textvariable=variable).pack(side="left",fill="x",expand=True,padx=6); ttk.Button(row,text="찾아보기",command=lambda:self.choose(variable)).pack(side="right")
     def choose(self,variable):
@@ -46,11 +39,15 @@ class DrawingCompareApp(tk.Tk):
             for pair_no,(bd,ad) in enumerate(pairs,1):
                 page_matches=page_matcher.match_pages(bd,ad); self.write_log(f"문서 {pair_no}: {bd.filename} ↔ {ad.filename}, 페이지 후보 {len(page_matches)}개")
                 for pm in page_matches:
-                    if pm.status == "NO_MATCH":
-                        self.write_log(f"페이지 보류: B{pm.before_page.page_index+1} ↔ A{pm.after_page.page_index+1}, score={pm.score:.3f}"); continue
-                    bp,ap=pm.before_page,pm.after_page
-                    self.status.set(f"비교 중... {bd.filename} p{bp.page_index+1}")
-                    try: aligned=aligner.align(bp.image,ap.image)
+                    if pm.status == "NO_MATCH": self.write_log(f"페이지 보류: B{pm.before_page.page_index+1} ↔ A{pm.after_page.page_index+1}, score={pm.score:.3f}"); continue
+                    bp,ap=pm.before_page,pm.after_page; self.status.set(f"비교 중... {bd.filename} p{bp.page_index+1}")
+                    try:
+                        alignment=aligner.align(bp.image,ap.image)
+                        if isinstance(alignment, AlignmentResult):
+                            aligned=alignment.image
+                            self.write_log(f"정렬: {alignment.method}, success={alignment.success}, scale={alignment.scale:.3f}, rotation={alignment.rotation:.2f}°, valid={alignment.valid_ratio:.2f}")
+                        else:
+                            aligned=alignment
                     except Exception as exc: self.write_log(f"정렬 경고: {exc}"); aligned=ap.image
                     result=detector.detect(bp,ap,aligned_after=aligned); self.write_log(f"검출 진단 p{bp.page_index+1}: {result.reason}")
                     for region_no,region in enumerate(result.regions,1):
@@ -86,9 +83,7 @@ class DrawingCompareApp(tk.Tk):
                 p=item.get(key)
                 if p and Path(p).exists():img=XLImage(p); img.width=150; img.height=80; ws.add_image(img,f"{chr(64+col)}{r}")
         wb.save(path)
-    def _finished(self,report,count):
-        self.progress.stop(); self.run_btn.configure(state="normal"); self.status.set(f"완료 — 변경영역 {count}개"); messagebox.showinfo("비교 완료",f"비교가 완료되었습니다.\n\n변경영역: {count}개\n결과: {report}")
-    def _failed(self,error):
-        self.progress.stop(); self.run_btn.configure(state="normal"); self.status.set("오류가 발생했습니다."); messagebox.showerror("비교 오류",error)
+    def _finished(self,report,count): self.progress.stop(); self.run_btn.configure(state="normal"); self.status.set(f"완료 — 변경영역 {count}개"); messagebox.showinfo("비교 완료",f"비교가 완료되었습니다.\n\n변경영역: {count}개\n결과: {report}")
+    def _failed(self,error): self.progress.stop(); self.run_btn.configure(state="normal"); self.status.set("오류가 발생했습니다."); messagebox.showerror("비교 오류",error)
 
 if __name__=="__main__":DrawingCompareApp().mainloop()
