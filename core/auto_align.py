@@ -14,7 +14,7 @@ class AlignmentResult:
     valid_ratio: float = 1.0
 
 class AutoAlign:
-    """Maps After into Before coordinates and exposes the exact transform used."""
+    """Warp After into the Before image coordinate system and expose that transform."""
     def __init__(self,max_rotation_deg:float=12.0): self.max_rotation_deg=float(max_rotation_deg)
     @staticmethod
     def _gray(image):
@@ -57,9 +57,9 @@ class AutoAlign:
                 print("자동 정렬 보류 : 신뢰할 수 있는 변환을 찾지 못했습니다.")
                 return AlignmentResult(after.copy(),None,"NONE",False)
             M,count,ratio,scale,rotation=result
-            flags=cv2.INTER_LINEAR if method=="ORB" else (cv2.INTER_LINEAR|cv2.WARP_INVERSE_MAP)
-            aligned=cv2.warpAffine(after,M,(w,h),flags=flags,borderMode=cv2.BORDER_CONSTANT,borderValue=255)
-            valid=np.full((h,w),255,np.uint8); vflags=cv2.INTER_NEAREST if method=="ORB" else (cv2.INTER_NEAREST|cv2.WARP_INVERSE_MAP); valid=cv2.warpAffine(valid,M,(w,h),flags=vflags); valid_ratio=float(np.count_nonzero(valid))/max(1,w*h)
+            # estimateAffinePartial2D above estimates source(After)->destination(Before).
+            aligned=cv2.warpAffine(after,M,(w,h),flags=cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT,borderValue=255)
+            valid=np.full((h,w),255,np.uint8); valid=cv2.warpAffine(valid,M,(w,h),flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT,borderValue=0); valid_ratio=float(np.count_nonzero(valid))/max(1,w*h)
             if valid_ratio<.70:
                 print("자동 정렬 보류 : 유효 영역이 너무 많이 손실되었습니다.")
                 return AlignmentResult(after.copy(),None,"NONE",False)
