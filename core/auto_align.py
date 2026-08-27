@@ -14,7 +14,7 @@ class AlignmentResult:
     valid_ratio: float = 1.0
 
 class AutoAlign:
-    """Warp After into Before coordinates. Matrix always maps After -> Before."""
+    """Warp After into Before coordinates. Returned matrix always maps After -> Before."""
     def __init__(self,max_rotation_deg:float=12.0): self.max_rotation_deg=float(max_rotation_deg)
     @staticmethod
     def _gray(image):
@@ -34,11 +34,9 @@ class AutoAlign:
         return count,ratio,scale,rotation
     def _feature_estimate(self,bg,ag,kind='ORB'):
         if kind=='SIFT' and hasattr(cv2,'SIFT_create'):
-            detector=cv2.SIFT_create(nfeatures=5000,contrastThreshold=.015,edgeThreshold=10)
-            norm=cv2.NORM_L2
+            detector=cv2.SIFT_create(nfeatures=5000,contrastThreshold=.015,edgeThreshold=10); norm=cv2.NORM_L2
         else:
-            detector=cv2.ORB_create(nfeatures=10000,scaleFactor=1.15,nlevels=10,fastThreshold=5)
-            norm=cv2.NORM_HAMMING
+            detector=cv2.ORB_create(nfeatures=10000,scaleFactor=1.15,nlevels=10,fastThreshold=5); norm=cv2.NORM_HAMMING
         kp1,d1=detector.detectAndCompute(bg,self._mask(bg)); kp2,d2=detector.detectAndCompute(ag,self._mask(ag))
         if d1 is None or d2 is None or len(kp1)<8 or len(kp2)<8:return None
         knn=cv2.BFMatcher(norm).knnMatch(d2,d1,k=2)
@@ -57,9 +55,12 @@ class AutoAlign:
         try: score,cc=cv2.findTransformECC(b,a,warp,cv2.MOTION_AFFINE,criteria,None,5)
         except cv2.error:return None
         if down!=1.: cc[0,2]/=down; cc[1,2]/=down
-        A=cc[:,:2]; det=float(np.linalg.det(A)); s=float(np.sqrt(abs(det))); rot=float(np.degrees(np.arctan2(A[1,0]-A[0,1],A[0,0]+A[1,1])))
+        # OpenCV ECC's matrix is used with WARP_INVERSE_MAP when warping the input.
+        # Therefore its inverse is the explicit After -> Before coordinate transform.
+        cc_h=np.vstack([cc,np.array([0.,0.,1.],dtype=np.float32)]); M=np.linalg.inv(cc_h)[:2].astype(np.float32)
+        A=M[:,:2]; det=float(np.linalg.det(A)); s=float(np.sqrt(abs(det))); rot=float(np.degrees(np.arctan2(A[1,0]-A[0,1],A[0,0]+A[1,1])))
         if det<=0 or not .70<=s<=1.40 or abs(rot)>self.max_rotation_deg or float(score)<.25:return None
-        return cc,0,float(score),s,rot,'ECC'
+        return M,0,float(score),s,rot,'ECC'
     def align(self,before_img,after_img):
         before=np.asarray(before_img); after=np.asarray(after_img); h,w=before.shape[:2]
         if before.size==0 or after.size==0:raise ValueError('Before/After 이미지가 비어 있습니다.')
@@ -75,12 +76,8 @@ class AutoAlign:
                 print('자동 정렬 보류 : SIFT/ORB/ECC에서 신뢰할 수 있는 공통 구조를 찾지 못했습니다.')
                 return AlignmentResult(after.copy(),None,'NONE',False)
             M,count,score,scale,rotation,method=result
-            if method=='ECC':
-                aligned=cv2.warpAffine(after,M,(w,h),flags=cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT,borderValue=255)
-                valid_src=np.full((h,w),255,np.uint8); valid=cv2.warpAffine(valid_src,M,(w,h),flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT,borderValue=0)
-            else:
-                aligned=cv2.warpAffine(after,M,(w,h),flags=cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT,borderValue=255)
-                valid_src=np.full((h,w),255,np.uint8); valid=cv2.warpAffine(valid_src,M,(w,h),flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+            aligned=cv2.warpAffine(after,M,(w,h),flags=cv2.INTER_LINEAR,borderMode=cv2.BORDER_CONSTANT,borderValue=255)
+            valid_src=np.full((h,w),255,np.uint8); valid=cv2.warpAffine(valid_src,M,(w,h),flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT,borderValue=0)
             valid_ratio=float(np.count_nonzero(valid))/max(1,w*h)
             if valid_ratio<.70:
                 print('자동 정렬 보류 : 유효 영역이 너무 많이 손실되었습니다.')
