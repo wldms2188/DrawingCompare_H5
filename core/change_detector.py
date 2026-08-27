@@ -29,9 +29,10 @@ class ChangeDetectionResult:
     def region(self): return self.regions
 
 class ChangeDetector:
-    """Text-first drawing comparison.
-    Dimensions/GD&T are matched locally around the same structural area.
-    Cross-tile arbitrary matching is intentionally avoided.
+    """Text-first engineering-drawing comparison.
+    Native PDF text is the primary source. OCR is a local high-resolution
+    supplement, rendered directly from the original vector PDF. Geometry itself
+    is not treated as a change target.
     """
     def __init__(self, config=None):
         self.pixel_threshold=38
@@ -84,8 +85,6 @@ class ChangeDetector:
         return out
 
     @staticmethod
-    def _crop(img,b): x0,y0,x1,y1=b; return img[y0:y1,x0:x1]
-    @staticmethod
     def _apply(p,M): return tuple((M[:,:2]@np.asarray(p)+M[:,2]).tolist()) if M is not None else p
 
     def _mapping_hint(self,before,after):
@@ -114,38 +113,65 @@ class ChangeDetector:
             if x0<=q["px"]<=x1 and y0<=q["py"]<=y1:out.append(q)
         return out
 
-    def _ocr_tile(self,img,box):
-        if self.pytesseract is None:return []
-        x0,y0,x1,y1=box; crop=img[y0:y1,x0:x1]
-        if crop.size==0:return []
-        g=self._gray(crop)
-        scale=max(1,2200//max(1,min(g.shape)))
-        g=cv2.resize(g,None,fx=scale,fy=scale,interpolation=cv2.INTER_CUBIC)
-        try:data=self.pytesseract.image_to_data(g,config="--psm 11",output_type=self.pytesseract.Output.DICT)
+    def _highres_ocr(self,page,box):
+        """OCR a candidate directly from vector PDF at 1200 DPI.
+        Returned coordinates are converted back to page.image pixels.
+        """
+        if self.pytesseract is None or not hasattr(page,"pdf_path"):return []
+        try:
+            from core.image_loader import ImageLoader
+            hi=ImageLoader().render_region(page,box,dpi=1200,margin=240)
+            if hi is None or hi.size==0:return []
+            g=self._gray(hi)
+            # Do not overprocess engineering strokes. Two conservative variants.
+            variants=[g,cv2.threshold(g,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]]
+            x0,y0,x1,y1=box
+            # render_region includes margin; approximate its page-pixel footprint
+            # from the actual crop aspect ratio and center, then map OCR boxes back.
+            # The exact mapping is recovered from the original PDF page rectangle.
+            import fitz
+            doc=fitz.open(Path(page.pdf_path)); p=doc.load_page(int(page.page_index)); pr=p.rect
+            sx=page.width/pr.width; sy=page.height/pr.height
+            mx=(240/page.width)*pr.width; my=(240/page.height)*pr.height
+            rx0=max(pr.x0,(x0/page.width)*pr.width-mx); ry0=max(pr.y0,(y0/page.height)*pr.height-my)
+            scale=1200/72.0
+            out=[]
+            for src in variants:
+                try:data=self.pytesseract.image_to_data(src,config="--psm 11",output_type=self.pytesseract.Output.DICT)
+                except Exception:continue
+                for i,t in enumerate(data.get("text",[])):
+                    t=str(t).strip()
+                    try:conf=float(data.get("conf",[-1])[i])
+                    except Exception:conf=-1
+                    if not t or conf<20:continue
+                    xx=float(data["left"][i])/scale+rx0; yy=float(data["top"][i])/scale+ry0
+                    ww=float(data["width"][i])/scale; hh=float(data["height"][i])/scale
+                    px=xx*sx; py=yy*sy; pw=ww*sx; ph=hh*sy
+                    out.append({"text":t,"px":px,"py":py,"pw":pw,"ph":ph,"class":self._class(t),"ocr":True,"conf":conf})
+            doc.close()
+            uniq=[]
+            for q in out:
+                if any(self._norm(q["text"])==self._norm(u["text"]) and abs(q["px"]-u["px"])<max(12,q["pw"]) and abs(q["py"]-u["py"])<max(12,q["ph"]) for u in uniq):continue
+                uniq.append(q)
+            return uniq
         except Exception:return []
-        out=[]
-        for i,t in enumerate(data.get("text",[])):
-            t=str(t).strip()
-            try:conf=float(data.get("conf",[-1])[i])
-            except Exception:conf=-1
-            if not t or conf<25:continue
-            x=int(data["left"][i]/scale+x0); y=int(data["top"][i]/scale+y0); ww=max(1,int(data["width"][i]/scale)); hh=max(1,int(data["height"][i]/scale))
-            out.append({"text":t,"px":x+ww/2,"py":y+hh/2,"pw":ww,"ph":hh,"class":self._class(t),"ocr":True})
+
+    def _merge_text(self,native,ocr):
+        out=list(native)
+        for q in ocr:
+            if any(abs(q["px"]-n["px"])<max(15,n["pw"]*1.2) and abs(q["py"]-n["py"])<max(15,n["ph"]*1.8) for n in native):continue
+            out.append(q)
         return out
 
     def _expanded_text_window(self,q,w,h):
-        # Dimension callouts are normally close to the feature. Keep the crop
-        # large enough to include the dimension line, arrows and neighbouring text.
-        pad=max(70,int(max(q.get("pw",20),q.get("ph",20))*6.0))
-        return (max(0,int(q["px"]-q.get("pw",20)/2-pad)),max(0,int(q["py"]-q.get("ph",20)/2-pad)),
-                min(w,int(q["px"]+q.get("pw",20)/2+pad)),min(h,int(q["py"]+q.get("ph",20)/2+pad)))
+        pad=max(90,int(max(q.get("pw",20),q.get("ph",20))*7.0))
+        return (max(0,int(q["px"]-q.get("pw",20)/2-pad)),max(0,int(q["py"]-q.get("ph",20)/2-pad)),min(w,int(q["px"]+q.get("pw",20)/2+pad)),min(h,int(q["py"]+q.get("ph",20)/2+pad)))
 
     def _compare_words(self,bw,aw,w,h):
         out=[];used=set()
         for o in bw:
             if o["class"]=="other":continue
             best=(-1,None)
-            # Position correspondence is local. We deliberately do not search the whole page.
             for j,n in enumerate(aw):
                 if j in used or n["class"]!=o["class"]:continue
                 dx=abs(o["px"]-n["px"])/max(1,w); dy=abs(o["py"]-n["py"])/max(1,h)
@@ -172,26 +198,26 @@ class ChangeDetector:
             after=self._img(aligned_after) if aligned_after is not None else raw_after
             if after.shape[:2]!=(h,w):after=cv2.resize(after,(w,h),interpolation=cv2.INTER_AREA)
             diff=cv2.absdiff(self._gray(before),self._gray(after)); _,mask=cv2.threshold(diff,self.pixel_threshold,255,cv2.THRESH_BINARY)
-            bw=self._native_words(before_page); aw=self._native_words(after_page)
-            bt=self._tiles(before); pairs=[]
-            # Fixed positional correspondence: same grid cell only.
+            bw=self._native_words(before_page); aw=self._native_words(after_page); bt=self._tiles(before)
+            pairs=[]
             for i,bb in enumerate(bt):
                 b=self._words_in_tile(bw,bb,before.shape); a=self._words_in_tile(aw,bb,after.shape,M)
                 if any(z["class"]!="other" for z in b) or any(z["class"]!="other" for z in a):pairs.append((i,i,1.0))
             candidates=[];added=deleted=0;ocr_used=0
             for bi,_,score in pairs:
-                box=bt[bi]; bwt=self._words_in_tile(bw,box,before.shape); awt=self._words_in_tile(aw,box,after.shape,M)
-                if not bwt:
-                    bwt=self._ocr_tile(before,box);ocr_used+=bool(bwt)
-                if not awt:
-                    awt=self._ocr_tile(after,box);ocr_used+=bool(awt)
+                box=bt[bi]
+                bnative=self._words_in_tile(bw,box,before.shape)
+                anative=self._words_in_tile(aw,box,after.shape,M)
+                # Always supplement sparse/fragmented native text with a true PDF render.
+                brocr=self._highres_ocr(before_page,box)
+                aocr=self._highres_ocr(after_page,box)
+                ocr_used+=bool(brocr)+bool(aocr)
+                bwt=self._merge_text(bnative,brocr); awt=self._merge_text(anative,aocr)
                 for o,n,kind in self._compare_words(bwt,awt,w,h):
                     q=o or n; x,y,x2,y2=self._expanded_text_window(q,w,h); local=diff[y:y2,x:x2]
                     ratio=float(np.mean(local>self.pixel_threshold)) if local.size else 0.0
-                    # Added/deleted text is accepted from PDF text coordinates;
-                    # changed text additionally requires visible raster evidence.
                     if kind=="changed" and ratio<0.0003:continue
-                    candidates.append(ChangeRegion(x,y,x2-x,y2-y,(x2-x)*(y2-y),ratio,"text_"+kind,.70,before[y:y2,x:x2].copy(),after[y:y2,x:x2].copy(),local.copy()))
+                    candidates.append(ChangeRegion(x,y,x2-x,y2-y,(x2-x)*(y2-y),ratio,"text_"+kind,.75,before[y:y2,x:x2].copy(),after[y:y2,x:x2].copy(),local.copy()))
                     added+=kind=="added";deleted+=kind=="deleted"
             merged=[]
             for r in candidates:
