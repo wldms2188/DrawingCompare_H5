@@ -13,6 +13,10 @@ class Box:
     def pad(self,p,W,H):
         x=max(0,self.x-int(p)); y=max(0,self.y-int(p)); xx=min(W,self.x+self.w+int(p)); yy=min(H,self.y+self.h+int(p))
         return Box(x,y,max(1,xx-x),max(1,yy-y))
+    @property
+    def right(self): return self.x+self.w
+    @property
+    def bottom(self): return self.y+self.h
 
 @dataclass
 class ChangeRegion:
@@ -47,10 +51,19 @@ class ChangeDetector:
     @staticmethod
     def _class(t):
         u=str(t).strip().upper()
-        if re.search(r'POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC|⌖|⌯|⏥|⌒|∥|⊥',u): return 'GDT'
+        if re.search(r'POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC|⌖|⌯|⏥|⌒|∥|⊥|\|',u): return 'GDT'
         if re.search(r'NOTE|NOTES|UNLESS|MATERIAL|FINISH|REMOVE|BURR|INSPECT|SEE|REMARK|COMMENT',u): return 'NOTE'
         if '±' in u or re.fullmatch(r'(?:R|M|D)?\s*(?:Ø|⌀)?\s*\d+(?:\.\d+)?(?:\s*[A-Z°]+)?',u) or re.fullmatch(r'\d+/\d+',u): return 'DIMENSION'
         return 'TEXT'
+    @staticmethod
+    def _class_token_context(token,context):
+        tc=ChangeDetector._class(token); cc=ChangeDetector._class(context)
+        # Semantic line context wins for NOTE/GD&T. This prevents values such as
+        # 0.05 inside a GD&T frame or AL6061 inside a NOTE from becoming generic dimensions.
+        if cc in ('NOTE','GDT'): return cc
+        return tc if tc!='TEXT' else cc
+    @staticmethod
+    def _kind(cls): return {'GDT':'gdt_change','DIMENSION':'dimension_change','NOTE':'note_change'}.get(cls,'text_change')
     def _words(self,page):
         try:
             import fitz
@@ -60,7 +73,7 @@ class ChangeDetector:
             out=[]
             for z in raw:
                 if len(z)<8 or not str(z[4]).strip(): continue
-                x0,y0,x1,y1,text,block,line,word=z[:8]; context=' '.join(lines.get((block,line),[str(text)])); c=self._class(text); cc=self._class(context); cls=c if c!='TEXT' else cc
+                x0,y0,x1,y1,text,block,line,word=z[:8]; context=' '.join(lines.get((block,line),[str(text)])); cls=self._class_token_context(str(text),context)
                 out.append({'text':str(text),'context':context,'x':x0/r.width,'y':y0/r.height,'w':(x1-x0)/r.width,'h':(y1-y0)/r.height,'class':cls,'cx':((x0+x1)/2)/r.width,'cy':((y0+y1)/2)/r.height})
             doc.close(); return out
         except Exception:return []
@@ -72,7 +85,7 @@ class ChangeDetector:
         ax,ay,axx,ayy=a.xyxy(); bx,by,bxx,byy=b.xyxy(); inter=max(0,min(axx,bxx)-max(ax,bx))*max(0,min(ayy,byy)-max(ay,by)); return inter/max(1,a.w*a.h+b.w*b.h-inter)
     @staticmethod
     def _word_box(w,pad=14):
-        x=int(round(w['x'])); y=int(round(w['y'])); xx=int(round((w['x']+w['w']))); yy=int(round((w['y']+w['h']))); return Box(x,y,max(1,xx-x),max(1,yy-y)).pad(pad,10**9,10**9)
+        x=int(round(w['x'])); y=int(round(w['y'])); xx=int(round(w['x']+w['w'])); yy=int(round(w['y']+w['h'])); return Box(x,y,max(1,xx-x),max(1,yy-y)).pad(pad,10**9,10**9)
     def _pixel_regions(self,before,after):
         if before.shape[:2]!=after.shape[:2]: return []
         a=self._gray(before); b=self._gray(after); diff=cv2.absdiff(a,b); _,th=cv2.threshold(diff,self.pixel_threshold,255,cv2.THRESH_BINARY); th=cv2.morphologyEx(th,cv2.MORPH_OPEN,np.ones((3,3),np.uint8)); n,_,stats,_=cv2.connectedComponentsWithStats(th,8); total=a.size; out=[]
@@ -88,14 +101,12 @@ class ChangeDetector:
                 M=np.asarray(alignment_matrix,dtype=np.float32).reshape(2,3); mapped=[self._map_box(q,M,after_original.shape[1],after_original.shape[0]) for q in new]
             else: mapped=new
             sx,sy=WV/max(1,W0),HV/max(1,H0); mapped=[{**q,'x':q['x']*sx,'y':q['y']*sy,'w':q['w']*sx,'h':q['h']*sy,'cx':q['cx']*sx,'cy':q['cy']*sy} for q in mapped]; oldpx=[{**q,'x':q['x']*W0,'y':q['y']*H0,'w':q['w']*W0,'h':q['h']*H0,'cx':q['cx']*W0,'cy':q['cy']*H0} for q in old]
-            # Strict geometric matching: same semantic class, similar text size, and a small local radius.
             candidates=[]; diag=min(WV,HV); maxd=max(35.0,diag*.018)
             for oi,o in enumerate(oldpx):
                 for ni,n in enumerate(mapped):
                     if o['class']!=n['class']: continue
-                    d=float(np.hypot(o['cx']-n['cx'],o['cy']-n['cy'])); size=max(o['h'],n['h'],1.0); size_ratio=max(o['h'],n['h'])/max(1.0,min(o['h'],n['h']))
-                    if d<=maxd and size_ratio<=1.8:
-                        candidates.append((d+abs(o['h']-n['h'])*2,oi,ni))
+                    d=float(np.hypot(o['cx']-n['cx'],o['cy']-n['cy'])); size_ratio=max(o['h'],n['h'])/max(1.0,min(o['h'],n['h']))
+                    if d<=maxd and size_ratio<=1.8: candidates.append((d+abs(o['h']-n['h'])*2,oi,ni))
             candidates.sort(); used_o=set(); used_n=set(); pairs=[]
             for score,oi,ni in candidates:
                 if oi in used_o or ni in used_n: continue
@@ -103,7 +114,7 @@ class ChangeDetector:
             regions=[]
             for o,n,score in pairs:
                 if self._norm_text(o['text'])==self._norm_text(n['text']): continue
-                ob=self._word_box(o); nb=self._word_box(n); x=min(ob.x,nb.x); y=min(ob.y,nb.y); xx=max(ob.x+ob.w,nb.x+nb.w); yy=max(ob.y+ob.h,nb.y+nb.h); box=Box(x,y,xx-x,yy-y).pad(6,WV,HV); cls=o['class']; kind={'GDT':'gdt_change','DIMENSION':'dimension_change','NOTE':'note_change','TEXT':'text_change'}[cls]
+                ob=self._word_box(o); nb=self._word_box(n); x=min(ob.x,nb.x); y=min(ob.y,nb.y); xx=max(ob.x+ob.w,nb.x+nb.w); yy=max(ob.y+ob.h,nb.y+nb.h); box=Box(x,y,xx-x,yy-y).pad(6,WV,HV); cls=o['class']; kind=self._kind(cls)
                 regions.append(ChangeRegion(box.x,box.y,box.w,box.h,box.w*box.h,0.0,kind,max(.5,1-score/max(1,maxd)),self._crop(before,box),self._crop(view,box),None,o['context'] if cls=='NOTE' else o['text'],n['context'] if cls=='NOTE' else n['text'],kind))
             pixels=self._pixel_regions(before,view)
             for pb in pixels:
