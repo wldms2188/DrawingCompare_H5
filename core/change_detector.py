@@ -1,141 +1,87 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass,field
 from pathlib import Path
-from typing import Optional, List
-import re
-import cv2
-import numpy as np
-
+import re,cv2,numpy as np
 @dataclass
 class ChangeRegion:
-    x:int; y:int; width:int; height:int; area:int=0; change_ratio:float=0.0
-    region_type:str="dimension_or_note"; confidence:float=0.0
-    old_crop:Optional[np.ndarray]=None; new_crop:Optional[np.ndarray]=None; difference_crop:Optional[np.ndarray]=None
-    @property
-    def left(self): return self.x
-    @property
-    def top(self): return self.y
-    @property
-    def right(self): return self.x+self.width
-    @property
-    def bottom(self): return self.y+self.height
-
+ x:int;y:int;width:int;height:int;area:int=0;change_ratio:float=0.;region_type:str="dimension_or_note";confidence:float=0.;old_crop:object=None;new_crop:object=None;difference_crop:object=None
+ @property
+ def right(self):return self.x+self.width
+ @property
+ def bottom(self):return self.y+self.height
 @dataclass
 class ChangeDetectionResult:
-    success:bool; regions:List[ChangeRegion]=field(default_factory=list)
-    difference_image:Optional[np.ndarray]=None; threshold_image:Optional[np.ndarray]=None
-    change_pixel_ratio:float=0.0; reason:str=""
-    @property
-    def region(self): return self.regions
-
+ success:bool;regions:list=field(default_factory=list);difference_image:object=None;threshold_image:object=None;change_pixel_ratio:float=0.;reason:str=""
+ @property
+ def region(self):return self.regions
 class ChangeDetector:
-    """Text-first engineering drawing detector.
-    Native PDF text is primary, OCR is secondary, raster heuristics are last.
-    Geometry-only changes are intentionally excluded.
-    """
-    def __init__(self, config=None):
-        self.pixel_threshold=38; self.pytesseract=None
-        try:
-            import pytesseract; self.pytesseract=pytesseract
-        except Exception: pass
-
-    @staticmethod
-    def _img(page):
-        if isinstance(page,np.ndarray): return np.asarray(page)
-        if hasattr(page,"image"): return np.asarray(page.image)
-        if hasattr(page,"array"): return np.asarray(page.array)
-        raise TypeError("페이지 이미지 배열을 찾을 수 없습니다.")
-    @staticmethod
-    def _gray(img):
-        if img.ndim==2:return img.astype(np.uint8)
-        if img.shape[2]==4:return cv2.cvtColor(img,cv2.COLOR_RGBA2GRAY)
-        return cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
-    @staticmethod
-    def _norm(s): return re.sub(r"\s+","",str(s).upper().replace("—","-").replace("–","-").replace("−","-"))
-    @staticmethod
-    def _target(text,h=8):
-        t=str(text).upper(); return bool(re.search(r"\d|Ø|⌀|%%C|±|\+/-|\+\-|NOTE|TYP|UNLESS|MATERIAL|FINISH|BURR|INSPECT|SEE",t)) or h>=9
-    @staticmethod
-    def _iou(a,b):
-        x1=max(a[0],b[0]); y1=max(a[1],b[1]); x2=min(a[0]+a[2],b[0]+b[2]); y2=min(a[1]+a[3],b[1]+b[3]); inter=max(0,x2-x1)*max(0,y2-y1); union=a[2]*a[3]+b[2]*b[3]-inter
-        return inter/max(1,union)
-
-    def _native_words(self,page):
-        try:
-            import fitz
-            doc=fitz.open(Path(page.pdf_path)); p=doc.load_page(int(page.page_index)); rect=p.rect; words=p.get_text("words"); doc.close(); out=[]
-            for item in words:
-                x0,y0,x1,y1,text,*_=item; text=str(text).strip()
-                if text: out.append({"text":text,"x":x0/rect.width,"y":y0/rect.height,"w":(x1-x0)/rect.width,"h":(y1-y0)/rect.height})
-            return out
-        except Exception:return []
-
-    def _native_text_changes(self,bp,ap,before,after,diff):
-        old=self._native_words(bp); new=self._native_words(ap); old_t=[x for x in old if self._target(x["text"],x["h"]*before.shape[0])]; new_t=[x for x in new if self._target(x["text"],x["h"]*after.shape[0])]; used=set(); candidates=[]; h,w=before.shape[:2]
-        for o in old_t:
-            best=None; best_score=1e9
-            for j,n in enumerate(new_t):
-                if j in used: continue
-                dx=abs(o["x"]+o["w"]/2-(n["x"]+n["w"]/2)); dy=abs(o["y"]+o["h"]/2-(n["y"]+n["h"]/2)); ds=abs(np.log(max(o["w"],1e-5)/max(n["w"],1e-5))); score=2*dx+2*dy+.25*min(ds,.8)
-                if dx<.06 and dy<.05 and score<best_score: best_score=score; best=j
-            if best is None: continue
-            n=new_t[best]; used.add(best)
-            if self._norm(o["text"])==self._norm(n["text"]): continue
-            x1=int(max(0,(o["x"]-.014)*w)); y1=int(max(0,(o["y"]-.020)*h)); x2=int(min(w,(o["x"]+o["w"]+.014)*w)); y2=int(min(h,(o["y"]+o["h"]+.020)*h)); local=diff[y1:y2,x1:x2]; ratio=float(np.mean(local>self.pixel_threshold)) if local.size else 0
-            if ratio>=.001: candidates.append((x1,y1,x2-x1,y2-y1,.94))
-        for j,n in enumerate(new_t):
-            if j in used: continue
-            near=any(abs(o["x"]+o["w"]/2-(n["x"]+n["w"]/2))<.035 and abs(o["y"]+o["h"]/2-(n["y"]+n["h"]/2))<.035 for o in old_t)
-            if near: continue
-            x1=int(max(0,(n["x"]-.014)*w)); y1=int(max(0,(n["y"]-.020)*h)); x2=int(min(w,(n["x"]+n["w"]+.014)*w)); y2=int(min(h,(n["y"]+n["h"]+.020)*h)); local=diff[y1:y2,x1:x2]
-            if local.size and float(np.mean(local>self.pixel_threshold))>=.001:candidates.append((x1,y1,x2-x1,y2-y1,.92))
-        return candidates,len(old),len(new),len(old_t),len(new_t)
-
-    def _ocr(self,gray):
-        if self.pytesseract is None:return []
-        try:
-            d=self.pytesseract.image_to_data(gray,config="--oem 3 --psm 11",output_type=self.pytesseract.Output.DICT); out=[]
-            for i,t in enumerate(d.get("text",[])):
-                t=(t or "").strip()
-                try:c=float(d["conf"][i])
-                except Exception:c=-1
-                if t and c>=18:
-                    x,y,w,h=[int(d[k][i]) for k in ("left","top","width","height")]
-                    if w>=3 and h>=3: out.append((x,y,w,h,t,c))
-            return out
-        except Exception:return []
-
-    def _image_text_fallback(self,before,after,diff,mask):
-        gray=self._gray(before); h,w=gray.shape; small=cv2.threshold(gray,185,255,cv2.THRESH_BINARY_INV)[1]; horiz=cv2.morphologyEx(small,cv2.MORPH_OPEN,cv2.getStructuringElement(cv2.MORPH_RECT,(max(9,w//180),1))); vert=cv2.morphologyEx(small,cv2.MORPH_OPEN,cv2.getStructuringElement(cv2.MORPH_RECT,(1,max(9,h//180)))); textmask=cv2.subtract(small,cv2.bitwise_or(horiz,vert)); n,_,stats,_=cv2.connectedComponentsWithStats(textmask,8); out=[]
-        for i in range(1,n):
-            x,y,ww,hh,area=map(int,stats[i]);
-            if area<5 or ww<2 or hh<2 or ww>.025*w or hh>.025*h:continue
-            p=max(18,int(max(ww,hh)*3)); x1=max(0,x-p); y1=max(0,y-p); x2=min(w,x+ww+p); y2=min(h,y+hh+p); local=diff[y1:y2,x1:x2]; ratio=float(np.mean(local>self.pixel_threshold))
-            if ratio<.025:continue
-            changed=np.count_nonzero(local>self.pixel_threshold); box_area=local.shape[0]*local.shape[1]
-            if changed>max(180,box_area*.22):continue
-            out.append((x1,y1,x2-x1,y2-y1,.52))
-        return out
-
-    def detect(self,before_page,after_page,aligned_after=None):
-        try:
-            before=self._img(before_page); after=self._img(after_page) if aligned_after is None else self._img(aligned_after); h,w=before.shape[:2]
-            if after.shape[:2]!=(h,w): after=cv2.resize(after,(w,h),interpolation=cv2.INTER_AREA)
-            gb=self._gray(before); ga=self._gray(after); diff=cv2.absdiff(gb,ga); _,mask=cv2.threshold(diff,self.pixel_threshold,255,cv2.THRESH_BINARY)
-            native,nob,noa,notg,natg=self._native_text_changes(before_page,after_page,before,after,diff); candidates=list(native); ob=oa=obt=oat=0; fallback=0
-            if not candidates and self.pytesseract is not None:
-                ob=len(self._ocr(gb)); oa=len(self._ocr(ga))
-            if not candidates and notg==0 and natg==0:
-                candidates=self._image_text_fallback(before,after,diff,mask); fallback=len(candidates)
-            regions=[]
-            for x,y,rw,rh,conf in candidates:
-                d=diff[y:y+rh,x:x+rw]; regions.append(ChangeRegion(x,y,rw,rh,rw*rh,float(np.mean(d>self.pixel_threshold)),"dimension_or_note",conf,before[y:y+rh,x:x+rw].copy(),after[y:y+rh,x:x+rw].copy(),d.copy()))
-            merged=[]
-            for r in regions:
-                for m in merged:
-                    if self._iou((r.x,r.y,r.width,r.height),(m.x,m.y,m.width,m.height))>.15:
-                        l=min(r.x,m.x); t=min(r.y,m.y); rr=max(r.right,m.right); bb=max(r.bottom,m.bottom); m.x,m.y,m.width,m.height=l,t,rr-l,bb-t; m.old_crop=before[t:bb,l:rr].copy(); m.new_crop=after[t:bb,l:rr].copy(); m.difference_crop=diff[t:bb,l:rr].copy(); m.confidence=max(m.confidence,r.confidence); m.change_ratio=float(np.mean(m.difference_crop>self.pixel_threshold)); break
-                else: merged.append(r)
-            reason=f"diag: native={nob}/{noa}, native_target={notg}/{natg}, ocr={ob}/{oa}, raw_diff={float(np.mean(mask>0)):.5f}, native_candidates={len(native)}, image_fallback={fallback}, final={len(merged)}"
-            return ChangeDetectionResult(True,merged,diff,mask,float(np.mean(mask>0)),reason)
-        except Exception as exc:return ChangeDetectionResult(False,[],reason=f"diag_error: {exc}")
+ def __init__(self,config=None):self.pixel_threshold=38
+ @staticmethod
+ def _img(p):return np.asarray(p if isinstance(p,np.ndarray) else p.image)
+ @staticmethod
+ def _gray(a):
+  if a.ndim==2:return a.astype(np.uint8)
+  if a.shape[2]==4:return cv2.cvtColor(a,cv2.COLOR_RGBA2GRAY)
+  return cv2.cvtColor(a,cv2.COLOR_BGR2GRAY)
+ @staticmethod
+ def _norm(s):return re.sub(r'\s+','',str(s).upper().replace('—','-').replace('–','-').replace('−','-'))
+ @staticmethod
+ def _target(s):return bool(re.search(r'\d|Ø|⌀|%%C|±|\+/-|\+\-|NOTE|TYP|UNLESS|MATERIAL|FINISH|BURR|INSPECT|SEE',str(s),re.I))
+ def _words(self,page):
+  try:
+   import fitz; d=fitz.open(Path(page.pdf_path));p=d.load_page(page.page_index);r=p.rect;w=p.get_text('words');d.close()
+   return [{'text':str(a[4]).strip(),'x':a[0]/r.width,'y':a[1]/r.height,'w':(a[2]-a[0])/r.width,'h':(a[3]-a[1])/r.height} for a in w if str(a[4]).strip()]
+  except Exception:return []
+ def _map(self,before,after):
+  a=self._gray(before);b=self._gray(after);h,w=a.shape
+  try:
+   orb=cv2.ORB_create(nfeatures=5000,fastThreshold=10);k1,d1=orb.detectAndCompute(a,None);k2,d2=orb.detectAndCompute(b,None)
+   if d1 is None or d2 is None:return None
+   ms=cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(d2,d1,k=2);good=[m[0] for m in ms if len(m)==2 and m[0].distance<.72*m[1].distance]
+   if len(good)<8:return None
+   src=np.float32([k2[m.queryIdx].pt for m in good]);dst=np.float32([k1[m.trainIdx].pt for m in good]);M,ins=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=4,maxIters=3000,confidence=.995)
+   if M is None or ins is None or ins.sum()<8 or ins.sum()/len(good)<.25:return None
+   det=np.linalg.det(M[:,:2]);s=np.sqrt(abs(det));rot=np.degrees(np.arctan2(M[1,0]-M[0,1],M[0,0]+M[1,1]))
+   if det<=0 or not .6<=s<=1.7 or abs(rot)>15:return None
+   return M,float(ins.sum()/len(good)),float(s),float(rot)
+  except Exception:return None
+ @staticmethod
+ def _xy(x,M,w,h):
+  p=M[:,:2]@np.array([(x['x']+x['w']/2)*w,(x['y']+x['h']/2)*h])+M[:,2];sx=np.linalg.norm(M[:,0]);sy=np.linalg.norm(M[:,1]);return {**x,'px':p[0],'py':p[1],'pw':x['w']*w*sx,'ph':x['h']*h*sy}
+ def _native(self,bp,ap,before,after,diff):
+  old=[x for x in self._words(bp) if self._target(x['text'])];new=[x for x in self._words(ap) if self._target(x['text'])];h,w=before.shape[:2];M=self._map(before,self._img(ap));
+  for x in old:x.update(px=(x['x']+x['w']/2)*w,py=(x['y']+x['h']/2)*h,pw=x['w']*w,ph=x['h']*h)
+  if M:new=[self._xy(x,M[0],w,h) for x in new]
+  else:
+   for x in new:x.update(px=(x['x']+x['w']/2)*w,py=(x['y']+x['h']/2)*h,pw=x['w']*w,ph=x['h']*h)
+  used=set();out=[]
+  for o in old:
+   choices=[]
+   for j,n in enumerate(new):
+    if j in used:continue
+    dx=abs(o['px']-n['px'])/w;dy=abs(o['py']-n['py'])/h;sz=abs(np.log(max(o['pw'],1)/max(n['pw'],1)))
+    if dx>.012 or dy>.010 or sz>.55:continue
+    # Require the same local drawing neighborhood, not merely similar page position.
+    r=max(25,int(2.5*max(o['pw'],o['ph'],n['pw'],n['ph'])));x1=max(0,int(o['px']-r));y1=max(0,int(o['py']-r));x2=min(w,int(o['px']+r));y2=min(h,int(o['py']+r));
+    r2=max(25,int(2.5*max(n['pw'],n['ph'])));u1=max(0,int(n['px']-r2));v1=max(0,int(n['py']-r2));u2=min(w,int(n['px']+r2));v2=min(h,int(n['py']+r2));
+    a=cv2.resize(self._gray(before[y1:y2,x1:x2]),(80,80));b=cv2.resize(self._gray(after[v1:v2,u1:u2]),(80,80));sim=float(cv2.matchTemplate(a,b,cv2.TM_CCOEFF_NORMED)[0,0])
+    if sim<.20:continue
+    score=dx+dy+.12*sz-.008*sim;choices.append((score,j))
+   if not choices:continue
+   _,j=min(choices);n=new[j];used.add(j)
+   if self._norm(o['text'])==self._norm(n['text']):continue
+   x1=max(0,int(min(o['px']-o['pw']/2,n['px']-n['pw']/2)-12));y1=max(0,int(min(o['py']-o['ph']/2,n['py']-n['ph']/2)-12));x2=min(w,int(max(o['px']+o['pw']/2,n['px']+n['pw']/2)+12));y2=min(h,int(max(o['py']+o['ph']/2,n['py']+n['ph']/2)+12));local=diff[y1:y2,x1:x2]
+   if local.size and np.mean(local>self.pixel_threshold)>=.001:out.append((x1,y1,x2-x1,y2-y1,.97))
+  return out,len(self._words(bp)),len(self._words(ap)),len(old),len(new),M
+ def detect(self,before_page,after_page,aligned_after=None):
+  try:
+   before=self._img(before_page);after=self._img(after_page) if aligned_after is None else self._img(aligned_after);h,w=before.shape[:2]
+   if after.shape[:2]!=(h,w):after=cv2.resize(after,(w,h),interpolation=cv2.INTER_AREA)
+   gb=self._gray(before);ga=self._gray(after);diff=cv2.absdiff(gb,ga);_,mask=cv2.threshold(diff,self.pixel_threshold,255,cv2.THRESH_BINARY)
+   cand,nb,na,nt,at,M=self._native(before_page,after_page,before,after,diff);regions=[]
+   for x,y,rw,rh,c in cand:
+    d=diff[y:y+rh,x:x+rw];regions.append(ChangeRegion(x,y,rw,rh,rw*rh,float(np.mean(d>self.pixel_threshold)),"dimension_or_note",c,before[y:y+rh,x:x+rw].copy(),after[y:y+rh,x:x+rw].copy(),d.copy()))
+   # Do not merge nearby but distinct dimension changes.
+   reason=f"diag: native={nb}/{na}, native_target={nt}/{at}, ocr=0/0, text_mapping={'ok' if M else 'none'}, raw_diff={np.mean(mask>0):.5f}, native_candidates={len(cand)}, image_fallback=0, final={len(regions)}"
+   return ChangeDetectionResult(True,regions,diff,mask,float(np.mean(mask>0)),reason)
+  except Exception as e:return ChangeDetectionResult(False,[],reason=f'diag_error: {e}')
