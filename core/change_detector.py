@@ -27,14 +27,13 @@ class ChangeDetectionResult:
     def region(self): return self.regions
 
 class ChangeDetector:
-    """Region-first drawing comparison.
+    """H5 region-first detector with a conservative native-text fallback.
 
-    No fixed grid. The detector builds semantic regions from visible frames,
-    NOTE blocks and connected drawing structure. A region is matched globally
-    by normalized geometry/edge structure. Only after a region correspondence
-    is established are native PDF text items compared inside that region.
-    Small dimensions and GD&T therefore inherit the context of their drawing
-    instead of being matched as isolated numbers.
+    Primary correspondence is semantic visual regions: framed boxes, NOTE
+    blocks and connected drawing groups. It never uses an arbitrary page grid.
+    If visual segmentation cannot establish a region pair, a restricted
+    normalized PDF-text-anchor fallback is used only for changed native text;
+    it does not manufacture added/deleted regions.
     """
     def __init__(self,config=None):
         self.pixel_threshold=34
@@ -43,11 +42,12 @@ class ChangeDetector:
         self.match_threshold=.40
         self.change_threshold=.00002
         self.text_position_tol=.075
+        self.fallback_position_tol=.055
 
     @staticmethod
     def _img(p):
-        if isinstance(p,np.ndarray): return np.asarray(p)
-        if hasattr(p,'image'): return np.asarray(p.image)
+        if isinstance(p,np.ndarray):return np.asarray(p)
+        if hasattr(p,'image'):return np.asarray(p.image)
         raise TypeError('페이지 이미지 배열을 찾을 수 없습니다.')
     @staticmethod
     def _gray(a):
@@ -60,60 +60,55 @@ class ChangeDetector:
     @staticmethod
     def _class(t):
         t=str(t).strip().upper()
-        if re.search(r'POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC|⌀|Ø|±|[⌖⌯⏥⌒∥⊥]',t): return 'gdt'
-        if re.fullmatch(r'(?:[RMD]?\s*)?[0-9]+(?:\.[0-9]+)?(?:\s*(?:MM|IN|°|DEG))?',t) or re.fullmatch(r'[0-9]+/[0-9]+',t): return 'dimension'
-        if any(k in t for k in ('NOTE','TYP','UNLESS','MATERIAL','FINISH','REMOVE','BURR','INSPECT','SEE')): return 'note'
+        if re.search(r'POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC|⌀|Ø|±|[⌖⌯⏥⌒∥⊥]',t):return 'gdt'
+        if re.fullmatch(r'(?:[RMD]?\s*)?[0-9]+(?:\.[0-9]+)?(?:\s*(?:MM|IN|°|DEG))?',t) or re.fullmatch(r'[0-9]+/[0-9]+',t):return 'dimension'
+        if any(k in t for k in ('NOTE','TYP','UNLESS','MATERIAL','FINISH','REMOVE','BURR','INSPECT','SEE')):return 'note'
         if re.search(r'[A-Z]',t) and len(t)>=2:return 'note'
         return 'other'
     def _words(self,page):
         try:
             import fitz
-            doc=fitz.open(page.pdf_path); p=doc.load_page(int(page.page_index)); r=p.rect; out=[]
+            doc=fitz.open(page.pdf_path);p=doc.load_page(int(page.page_index));r=p.rect;out=[]
             for z in p.get_text('words'):
-                x0,y0,x1,y1,text,*_=z; text=str(text).strip()
-                if text: out.append({'text':text,'x':x0/r.width,'y':y0/r.height,'w':(x1-x0)/r.width,'h':(y1-y0)/r.height,'class':self._class(text)})
-            doc.close(); return out
+                x0,y0,x1,y1,text,*_=z;text=str(text).strip()
+                if text:out.append({'text':text,'x':x0/r.width,'y':y0/r.height,'w':(x1-x0)/r.width,'h':(y1-y0)/r.height,'class':self._class(text)})
+            doc.close();return out
         except Exception:return []
     @staticmethod
     def _crop(img,box):
-        x0,y0,x1,y1=map(int,box); h,w=img.shape[:2]
+        x0,y0,x1,y1=map(int,box);h,w=img.shape[:2]
         return img[max(0,y0):min(h,y1),max(0,x0):min(w,x1)]
     @staticmethod
     def _expand(box,pad,w,h):
         x,y,ww,hh=box
         return max(0,int(x-pad)),max(0,int(y-pad)),min(w,int(x+ww+pad)),min(h,int(y+hh+pad))
     def _visual_regions(self,img):
-        """Extract actual connected drawing regions, not artificial page tiles."""
-        g=self._gray(img); h,w=g.shape
+        g=self._gray(img);h,w=g.shape
         bw=cv2.adaptiveThreshold(g,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,41,9)
-        # Join close strokes so a frame + its contents + attached leaders form one component.
-        k=max(3,int(min(h,w)/1000)); k += k%2==0
+        k=max(3,int(min(h,w)/1000));k+=k%2==0
         closed=cv2.morphologyEx(bw,cv2.MORPH_CLOSE,cv2.getStructuringElement(cv2.MORPH_RECT,(k*3,k*3)))
         contours,_=cv2.findContours(closed,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
         raw=[]
         for c in contours:
-            x,y,ww,hh=cv2.boundingRect(c); area=ww*hh
-            if area<self.min_region_area or ww<18 or hh<18: continue
-            if ww>.92*w and hh>.92*h: continue
+            x,y,ww,hh=cv2.boundingRect(c);area=ww*hh
+            if area<self.min_region_area or ww<18 or hh<18:continue
+            if ww>.92*w and hh>.92*h:continue
             raw.append([x,y,ww,hh])
-        # Merge boxes that are spatially connected/near. This deliberately keeps dimensions
-        # attached to their nearby structure rather than making a separate number region.
         merged=True
         while merged:
-            merged=False; out=[]; used=[False]*len(raw)
+            merged=False;out=[];used=[False]*len(raw)
             for i,a in enumerate(raw):
-                if used[i]: continue
-                x,y,ww,hh=a; used[i]=True
-                again=True
+                if used[i]:continue
+                x,y,ww,hh=a;used[i]=True;again=True
                 while again:
                     again=False
                     ax0,ay0,ax1,ay1=x-self.region_gap,y-self.region_gap,x+ww+self.region_gap,y+hh+self.region_gap
                     for j,b in enumerate(raw):
-                        if used[j]: continue
+                        if used[j]:continue
                         bx,by,bw,bh=b
                         if bx<ax1 and bx+bw>ax0 and by<ay1 and by+bh>ay0:
-                            nx,ny=min(x,bx),min(y,by); xx,yy=max(x+ww,bx+bw),max(y+hh,by+bh)
-                            x,y,ww,hh=nx,ny,xx-nx,yy-ny; used[j]=True; again=True; merged=True
+                            nx,ny=min(x,bx),min(y,by);xx,yy=max(x+ww,bx+bw),max(y+hh,by+bh)
+                            x,y,ww,hh=nx,ny,xx-nx,yy-ny;used[j]=True;again=True;merged=True
                 out.append([x,y,ww,hh])
             raw=out
         return raw
@@ -122,37 +117,34 @@ class ChangeDetector:
         if a.size==0 or b.size==0:return 0.0
         aa=cv2.resize(ChangeDetector._gray(a),(384,384),interpolation=cv2.INTER_CUBIC)
         bb=cv2.resize(ChangeDetector._gray(b),(384,384),interpolation=cv2.INTER_CUBIC)
-        ae=cv2.Canny(aa,30,105); be=cv2.Canny(bb,30,105)
+        ae=cv2.Canny(aa,30,105);be=cv2.Canny(bb,30,105)
         corr=float(cv2.matchTemplate(ae,be,cv2.TM_CCOEFF_NORMED)[0,0])
-        da=float(np.mean(ae>0)); db=float(np.mean(be>0))
-        density=1-min(1,abs(da-db)*6)
+        da=float(np.mean(ae>0));db=float(np.mean(be>0));density=1-min(1,abs(da-db)*6)
         return max(0,.80*corr+.20*density)
     def _region_kind(self,box,words,shape):
-        x,y,w,h=box; vals=[]
+        x,y,w,h=box;vals=[]
         for q in words:
-            px=(q['x']+q['w']/2)*shape[1]; py=(q['y']+q['h']/2)*shape[0]
-            if x<=px<=x+w and y<=py<=y+h: vals.append(q)
+            px=(q['x']+q['w']/2)*shape[1];py=(q['y']+q['h']/2)*shape[0]
+            if x<=px<=x+w and y<=py<=y+h:vals.append(q)
         text=' '.join(q['text'] for q in vals).upper()
-        if 'NOTE' in text or any(q['class']=='note' for q in vals): return 'note'
-        if any(q['class']=='gdt' for q in vals): return 'gdt_region'
-        if any(q['class']=='dimension' for q in vals): return 'dimension_region'
+        if 'NOTE' in text or any(q['class']=='note' for q in vals):return 'note'
+        if any(q['class']=='gdt' for q in vals):return 'gdt_region'
+        if any(q['class']=='dimension' for q in vals):return 'dimension_region'
         return 'structural_region'
     def _match_regions(self,before,after,br,ar):
-        bh,bw=before.shape[:2]; ah,aw=after.shape[:2]; candidates=[]
+        bh,bw=before.shape[:2];ah,aw=after.shape[:2];candidates=[]
         for i,(x,y,w,h) in enumerate(br):
-            bc=self._crop(before,(x,y,x+w,y+h)); bcx=(x+w/2)/bw; bcy=(y+h/2)/bh
+            bc=self._crop(before,(x,y,x+w,y+h));bcx=(x+w/2)/bw;bcy=(y+h/2)/bh
             for j,(xx,yy,ww,hh) in enumerate(ar):
-                ac=self._crop(after,(xx,yy,xx+ww,yy+hh)); acx=(xx+ww/2)/aw; acy=(yy+hh/2)/ah
+                ac=self._crop(after,(xx,yy,xx+ww,yy+hh));acx=(xx+ww/2)/aw;acy=(yy+hh/2)/ah
                 pos=((bcx-acx)**2+(bcy-acy)**2)**.5
                 size=abs(np.log(max(1,w)/max(1,ww)))+abs(np.log(max(1,h)/max(1,hh)))
                 vs=self._edge_score(bc,ac)
-                # visual structure is strongest; page-relative position/scale break ties.
                 score=.68*vs+.20*max(0,1-pos*2.5)+.12*max(0,1-size/2.2)
                 candidates.append((score,vs,i,j,pos,size))
-        candidates.sort(reverse=True)
-        used_b=set(); used_a=set(); pairs=[]
+        candidates.sort(reverse=True);used_b=set();used_a=set();pairs=[]
         for score,vs,i,j,pos,size in candidates:
-            if i in used_b or j in used_a or score<self.match_threshold: continue
+            if i in used_b or j in used_a or score<self.match_threshold:continue
             used_b.add(i);used_a.add(j);pairs.append((i,j,score,vs))
         return pairs
     def _inside_words(self,words,box,shape):
@@ -161,63 +153,80 @@ class ChangeDetector:
             px=(q['x']+q['w']/2)*shape[1];py=(q['y']+q['h']/2)*shape[0]
             if x<=px<=x+w and y<=py<=y+h:out.append(q)
         return out
-    def _word_pairs(self,old,new,old_shape,new_shape):
-        pairs=[]; used=set()
-        # First prefer identical normalized text: it gives stable local anchors without
-        # turning an unmatched value into an 'added' change.
-        for i,o in enumerate(old):
+    def _word_pairs(self,old,new):
+        pairs=[];used=set()
+        # Class and normalized page position are the stable keys. Text identity is
+        # deliberately NOT required, because changed values are expected to differ.
+        for o in old:
             best=None
             for j,n in enumerate(new):
-                if j in used or n['class']!=o['class']: continue
+                if j in used or n['class']!=o['class']:continue
                 d=((o['x']+o['w']/2-(n['x']+n['w']/2))**2+(o['y']+o['h']/2-(n['y']+n['h']/2))**2)**.5
-                if d>self.text_position_tol: continue
-                same=self._norm(o['text'])==self._norm(n['text'])
-                score=d-(.045 if same else 0)
-                if best is None or score<best[0]: best=(score,j,n,same)
+                size=abs(np.log(max(1,o['w'])/max(1,n['w'])))+abs(np.log(max(1,o['h'])/max(1,n['h'])))
+                if d>self.fallback_position_tol or size>1.1:continue
+                # Prefer the same approximate glyph size and nearest position.
+                score=d+.025*size
+                if best is None or score<best[0]:best=(score,j,n)
             if best:
-                used.add(best[1]);pairs.append((o,best[2],best[3]))
+                used.add(best[1]);pairs.append((o,best[2],self._norm(o['text'])==self._norm(best[2]['text'])))
         return pairs
-    def detect(self,before_page,after_page,aligned_after=None):
-        try:
-            before=self._img(before_page); after=self._img(aligned_after) if aligned_after is not None else self._img(after_page)
-            old_words=self._words(before_page); new_words=self._words(after_page)
-            br=self._visual_regions(before); ar=self._visual_regions(after)
-            region_pairs=self._match_regions(before,after,br,ar)
-            gray0=self._gray(before); gray1=self._gray(after)
-            if gray1.shape!=gray0.shape: gray1=cv2.resize(gray1,(gray0.shape[1],gray0.shape[0]),interpolation=cv2.INTER_AREA)
-            diff=cv2.absdiff(gray0,gray1); _,mask=cv2.threshold(diff,self.pixel_threshold,255,cv2.THRESH_BINARY)
-            regions=[]; changed=0
-            for bi,ai,score,visual in region_pairs:
-                bx,by,bw,bh=br[bi]; ax,ay,aw,ah=ar[ai]
-                pad=max(16,int(max(aw,ah)*.18))
-                # For reporting use the matched After region with generous context for attached dimensions/leaders.
-                x,y,x2,y2=self._expand((ax,ay,aw,ah),pad,after.shape[1],after.shape[0]); box=(x,y,x2-x,y2-y)
-                old_box=self._expand((bx,by,bw,bh),pad,before.shape[1],before.shape[0])
-                old_local=self._crop(before,old_box); new_local=self._crop(after,box); local_diff=self._crop(diff,box)
-                ratio=float(np.mean(local_diff>self.pixel_threshold)) if local_diff.size else 0
-                ow=self._inside_words(old_words,old_box,before.shape); nw=self._inside_words(new_words,box,after.shape)
-                for o,n,same in self._word_pairs(ow,nw,before.shape,after.shape):
-                    if same: continue
-                    changed+=1; kind=self._region_kind(box,old_words,before.shape)
-                    typ={'note':'note_change','gdt_region':'gdt_change','dimension_region':'dimension_change'}.get(kind,'structural_text_change')
-                    regions.append(ChangeRegion(x,y,x2-x,y2-y,(x2-x)*(y2-y),ratio,typ,min(1,score),old_local.copy(),new_local.copy(),local_diff.copy(),o['text'],n['text'],'changed_value'))
-                # If native PDF text is absent, retain a high-confidence visual change only when
-                # the matched region itself has meaningful changed pixels. This handles vector/raster text.
-                if not ow or not nw:
-                    if ratio>=self.change_threshold and visual>=.55:
-                        regions.append(ChangeRegion(x,y,x2-x,y2-y,(x2-x)*(y2-y),ratio,'visual_change',min(1,score),old_local.copy(),new_local.copy(),local_diff.copy(),'','', 'visual_change'))
-            # Merge duplicate reports generated by multiple changed words in the same semantic region.
-            out=[]
-            for r in sorted(regions,key=lambda q:-q.confidence):
-                if any(self._iou((r.x,r.y,r.width,r.height),(q.x,q.y,q.width,q.height))>.55 for q in out): continue
-                out.append(r)
-            reason=(f'diag: native={len(old_words)}/{len(new_words)}, mapping=semantic_regions, '
-                    f'regions={len(br)}/{len(ar)}, region_pairs={len(region_pairs)}, changed_values={changed}, '
-                    f'added=0, deleted=0, final={len(out)}')
-            return ChangeDetectionResult(True,out,diff,mask,float(np.mean(mask>0)),reason)
-        except Exception as exc:
-            return ChangeDetectionResult(False,[],reason=f'diag_error: {exc}')
-
+    def _fallback_text_changes(self,before,after,old_words,new_words):
+        # This is a safety net, not a second global visual matcher. Only words
+        # that have a native PDF counterpart at nearly the same normalized page
+        # location are considered. This is appropriate for vector PDF drawings
+        # where contours cannot be segmented reliably.
+        regions=[];pairs=self._word_pairs(old_words,new_words);changed=0
+        for o,n,same in pairs:
+            if same:continue
+            x0=(o['x']-0.025)*before.shape[1];y0=(o['y']-0.035)*before.shape[0]
+            x1=(o['x']+o['w']+0.025)*before.shape[1];y1=(o['y']+o['h']+0.035)*before.shape[0]
+            nx0=(n['x']-0.025)*after.shape[1];ny0=(n['y']-0.035)*after.shape[0]
+            nx1=(n['x']+n['w']+0.025)*after.shape[1];ny1=(n['y']+n['h']+0.035)*after.shape[0]
+            # Report around the After anchor, then expand toward nearby strokes.
+            x,y,xx,yy=self._expand((int(nx0),int(ny0),int(nx1-nx0),int(ny1-ny0)),max(18,int(max(nx1-nx0,ny1-ny0)*1.8)),after.shape[1],after.shape[0])
+            box=(x,y,xx-x,yy-y);local=self._crop(after,(x,y,xx,yy));old_local=self._crop(before,(int(x0),int(y0),int(x1),int(y1)))
+            diff=cv2.absdiff(self._gray(self._resize_like(old_local,local)),self._gray(local)) if old_local.size and local.size else np.empty((0,0),np.uint8)
+            kind=self._class(o['text']);typ={'dimension':'dimension_change','gdt':'gdt_change','note':'note_change'}.get(kind,'text_change')
+            regions.append(ChangeRegion(x,y,xx-x,yy-y,(xx-x)*(yy-y),float(np.mean(diff>self.pixel_threshold)) if diff.size else 0,typ,.72,old_local.copy(),local.copy(),diff.copy(),o['text'],n['text'],'changed_value'));changed+=1
+        return regions,changed,len(pairs)
+    @staticmethod
+    def _resize_like(a,b):
+        if a.shape[:2]==b.shape[:2]:return a
+        return cv2.resize(a,(b.shape[1],b.shape[0]),interpolation=cv2.INTER_CUBIC)
     @staticmethod
     def _iou(a,b):
         x=max(a[0],b[0]);y=max(a[1],b[1]);xx=min(a[0]+a[2],b[0]+b[2]);yy=min(a[1]+a[3],b[1]+b[3]);inter=max(0,xx-x)*max(0,yy-y);u=a[2]*a[3]+b[2]*b[3]-inter;return inter/max(1,u)
+    def detect(self,before_page,after_page,aligned_after=None):
+        try:
+            before=self._img(before_page);after=self._img(aligned_after) if aligned_after is not None else self._img(after_page)
+            old_words=self._words(before_page);new_words=self._words(after_page)
+            br=self._visual_regions(before);ar=self._visual_regions(after);region_pairs=self._match_regions(before,after,br,ar)
+            gray0=self._gray(before);gray1=self._gray(after)
+            if gray1.shape!=gray0.shape:gray1=cv2.resize(gray1,(gray0.shape[1],gray0.shape[0]),interpolation=cv2.INTER_AREA)
+            diff=cv2.absdiff(gray0,gray1);_,mask=cv2.threshold(diff,self.pixel_threshold,255,cv2.THRESH_BINARY)
+            regions=[];changed=0
+            for bi,ai,score,visual in region_pairs:
+                bx,by,bw,bh=br[bi];ax,ay,aw,ah=ar[ai];pad=max(16,int(max(aw,ah)*.18))
+                x,y,x2,y2=self._expand((ax,ay,aw,ah),pad,after.shape[1],after.shape[0]);box=(x,y,x2-x,y2-y);old_box=self._expand((bx,by,bw,bh),pad,before.shape[1],before.shape[0])
+                old_local=self._crop(before,old_box);new_local=self._crop(after,box);local_diff=self._crop(diff,box);ratio=float(np.mean(local_diff>self.pixel_threshold)) if local_diff.size else 0
+                ow=self._inside_words(old_words,old_box,before.shape);nw=self._inside_words(new_words,box,after.shape)
+                for o,n,same in self._word_pairs(ow,nw):
+                    if same:continue
+                    changed+=1;kind=self._region_kind(box,old_words,before.shape);typ={'note':'note_change','gdt_region':'gdt_change','dimension_region':'dimension_change'}.get(kind,'structural_text_change')
+                    regions.append(ChangeRegion(x,y,x2-x,y2-y,(x2-x)*(y2-y),ratio,typ,min(1,score),old_local.copy(),new_local.copy(),local_diff.copy(),o['text'],n['text'],'changed_value'))
+                if not ow or not nw:
+                    if ratio>=self.change_threshold and visual>=.55:regions.append(ChangeRegion(x,y,x2-x,y2-y,(x2-x)*(y2-y),ratio,'visual_change',min(1,score),old_local.copy(),new_local.copy(),local_diff.copy(),'','', 'visual_change'))
+            fallback_used=False;fallback_pairs=0
+            if not region_pairs:
+                fallback_used=True
+                fb,changed_fb,fallback_pairs=self._fallback_text_changes(before,after,old_words,new_words)
+                regions.extend(fb);changed+=changed_fb
+            out=[]
+            for r in sorted(regions,key=lambda q:-q.confidence):
+                if any(self._iou((r.x,r.y,r.width,r.height),(q.x,q.y,q.width,q.height))>.55 for q in out):continue
+                out.append(r)
+            reason=(f'diag: native={len(old_words)}/{len(new_words)}, mapping=' + ('native_anchor_fallback' if fallback_used else 'semantic_regions') + ', '
+                    f'regions={len(br)}/{len(ar)}, region_pairs={len(region_pairs)}, fallback_pairs={fallback_pairs}, changed_values={changed}, '
+                    f'added=0, deleted=0, final={len(out)}')
+            return ChangeDetectionResult(True,out,diff,mask,float(np.mean(mask>0)),reason)
+        except Exception as exc:return ChangeDetectionResult(False,[],reason=f'diag_error: {exc}')
