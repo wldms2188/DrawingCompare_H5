@@ -29,18 +29,19 @@ class ChangeDetectionResult:
     def region(self): return self.regions
 
 class ChangeDetector:
-    """H5: report only actual dimension/GD&T/note text changes.
+    """Tile-first H5 detector.
 
-    Important: a changed PDF word is NOT sufficient evidence. A candidate must
-    also be located in a dimension/note context. Standalone title blocks,
-    revision tables, labels and unrelated text are rejected. Geometry-only
-    raster differences are never used as a fallback.
+    The page is divided into overlapping tiles. Each tile is analyzed at high
+    resolution independently, then Before/After tiles are matched by their
+    visual structure and native PDF text inventory. This prevents unrelated
+    words from being paired merely because their global coordinates are close.
+    Geometry-only differences are never reported.
     """
     def __init__(self, config=None):
-        self.pixel_threshold=38; self.pytesseract=None
+        self.pixel_threshold=38; self.grid_cols=5; self.grid_rows=4; self.overlap=.15
         try:
             import pytesseract; self.pytesseract=pytesseract
-        except Exception: pass
+        except Exception: self.pytesseract=None
 
     @staticmethod
     def _img(page):
@@ -56,117 +57,114 @@ class ChangeDetector:
     @staticmethod
     def _norm(s): return re.sub(r"\s+","",str(s).upper().replace("—","-").replace("–","-").replace("−","-"))
     @staticmethod
-    def _is_dimension_token(t):
-        t=str(t).upper();
-        return bool(re.search(r"(?:^|[^A-Z])(\d+(?:\.\d+)?|\.\d+)(?:\s*(?:MM|IN|°|DEG))?$",t)) or bool(re.search(r"(?:Ø|⌀|%%C|±|\+/-|R\s*\d|M\d|[0-9]+\.[0-9]+)",t))
-    @staticmethod
-    def _is_gdt_token(t):
-        t=str(t).upper(); return bool(re.search(r"(?:Ø|⌀|±|\+/-|\|)|(?:POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC)",t))
-    @staticmethod
-    def _is_note_token(t):
-        t=str(t).upper(); return any(k in t for k in ("NOTE","TYP","UNLESS","MATERIAL","FINISH","REMOVE","BURR","INSPECT","SEE"))
-    @staticmethod
-    def _target(text,h=8):
-        return ChangeDetector._is_dimension_token(text) or ChangeDetector._is_gdt_token(text) or ChangeDetector._is_note_token(text)
-    @staticmethod
-    def _iou(a,b):
-        x1=max(a[0],b[0]); y1=max(a[1],b[1]); x2=min(a[0]+a[2],b[0]+b[2]); y2=min(a[1]+a[3],b[1]+b[3]); inter=max(0,x2-x1)*max(0,y2-y1); union=a[2]*a[3]+b[2]*b[3]-inter; return inter/max(1,union)
-
+    def _class(t):
+        t=str(t).upper()
+        g=bool(re.search(r"(?:Ø|⌀|±|\+/-|\||POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC)",t))
+        d=bool(re.search(r"(?:^|[^A-Z])(\d+(?:\.\d+)?|\.\d+)(?:\s*(?:MM|IN|°|DEG))?$",t)) or bool(re.search(r"(?:Ø|⌀|%%C|±|\+/-|R\s*\d|M\d|[0-9]+\.[0-9]+)",t))
+        n=any(k in t for k in ("NOTE","TYP","UNLESS","MATERIAL","FINISH","REMOVE","BURR","INSPECT","SEE"))
+        return "gdt" if g else "dimension" if d else "note" if n else "other"
     def _native_words(self,page):
         try:
             import fitz
-            doc=fitz.open(Path(page.pdf_path)); p=doc.load_page(int(page.page_index)); rect=p.rect; words=p.get_text("words"); doc.close(); out=[]
-            for item in words:
-                x0,y0,x1,y1,text,*_=item; text=str(text).strip()
-                if text: out.append({"text":text,"x":x0/rect.width,"y":y0/rect.height,"w":(x1-x0)/rect.width,"h":(y1-y0)/rect.height})
+            doc=fitz.open(Path(page.pdf_path)); p=doc.load_page(int(page.page_index)); r=p.rect; words=p.get_text("words"); doc.close(); out=[]
+            for z in words:
+                x0,y0,x1,y1,text,*_=z; text=str(text).strip()
+                if text: out.append({"text":text,"x":x0/r.width,"y":y0/r.height,"w":(x1-x0)/r.width,"h":(y1-y0)/r.height,"class":self._class(text)})
             return out
         except Exception:return []
-
-    def _estimate_mapping(self,before,after):
-        bg=self._gray(before); ag=self._gray(after); h,w=bg.shape
-        if ag.shape!=bg.shape: ag=cv2.resize(ag,(w,h),interpolation=cv2.INTER_AREA)
+    def _tiles(self,img):
+        h,w=img.shape[:2]; tw=w/self.grid_cols; th=h/self.grid_rows; tiles=[]
+        for ry in range(self.grid_rows):
+            for cx in range(self.grid_cols):
+                x0=max(0,int(cx*tw-tw*self.overlap/2)); x1=min(w,int((cx+1)*tw+tw*self.overlap/2)); y0=max(0,int(ry*th-th*self.overlap/2)); y1=min(h,int((ry+1)*th+th*self.overlap/2)); tiles.append((x0,y0,x1,y1))
+        return tiles
+    def _tile_signature(self,img):
+        g=self._gray(img); small=cv2.resize(g,(32,32),interpolation=cv2.INTER_AREA); edges=cv2.Canny(g,50,150); e=cv2.resize(edges,(16,16),interpolation=cv2.INTER_AREA); return np.concatenate([(small.astype(np.float32)-small.mean())/(small.std()+1),e.astype(np.float32)/255]).astype(np.float32)
+    def _mapping(self,before,after):
+        bg=self._gray(before); ag=self._gray(after); h,w=bg.shape; ag=cv2.resize(ag,(w,h),interpolation=cv2.INTER_AREA)
         try:
             orb=cv2.ORB_create(nfeatures=6000,fastThreshold=8); k1,d1=orb.detectAndCompute(bg,None); k2,d2=orb.detectAndCompute(ag,None)
             if d1 is None or d2 is None:return None
-            matches=cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(d2,d1,k=2); good=[m[0] for m in matches if len(m)==2 and m[0].distance<.70*m[1].distance]
+            ms=cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(d2,d1,k=2); good=[m[0] for m in ms if len(m)==2 and m[0].distance<.70*m[1].distance]
             if len(good)<10:return None
-            src=np.float32([k2[m.queryIdx].pt for m in good]); dst=np.float32([k1[m.trainIdx].pt for m in good]); M,inl=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=3.5,maxIters=5000,confidence=.995)
-            if M is None or inl is None:return None
-            ratio=float(inl.sum())/len(good); a,b,tx=M[0]; c,d,ty=M[1]; scale=float(np.sqrt(abs(a*d-b*c))); rot=float(np.degrees(np.arctan2(c-b,a+d)))
-            if int(inl.sum())<10 or ratio<.35 or not .70<=scale<=1.45 or abs(rot)>10:return None
-            return M,ratio,scale,rot
+            src=np.float32([k2[m.queryIdx].pt for m in good]); dst=np.float32([k1[m.trainIdx].pt for m in good]); M,mask=cv2.estimateAffinePartial2D(src,dst,method=cv2.RANSAC,ransacReprojThreshold=3.5,maxIters=5000,confidence=.995)
+            if M is None or mask is None or int(mask.sum())<10 or float(mask.sum())/len(good)<.35:return None
+            a,b,_=M[0]; c,d,_=M[1]; scale=float(np.sqrt(abs(a*d-b*c))); rot=float(np.degrees(np.arctan2(c-b,a+d)))
+            if not .70<=scale<=1.45 or abs(rot)>10:return None
+            return M
         except Exception:return None
-
     @staticmethod
-    def _transform_word(word,M,before_shape):
-        h,w=before_shape[:2]; cx=(word["x"]+word["w"]/2)*w; cy=(word["y"]+word["h"]/2)*h; p=M[:,:2]@np.array([cx,cy])+M[:,2]; sx=max(.001,float(np.hypot(M[0,0],M[1,0]))); sy=max(.001,float(np.hypot(M[0,1],M[1,1]))); return {**word,"px":float(p[0]),"py":float(p[1]),"pw":word["w"]*w*sx,"ph":word["h"]*h*sy}
-
-    def _context_score(self,word,all_words,shape):
-        h,w=shape[:2]; x=word["px"]; y=word["py"]; radius_x=.045*w; radius_y=.035*h
-        near=[]
-        for q in all_words:
-            if q is word: continue
-            if abs(q["px"]-x)<radius_x and abs(q["py"]-y)<radius_y: near.append(q)
-        # Dimension/GD&T context is strongest when there is a nearby leader,
-        # datum letter, tolerance token, unit, or another numeric token.
-        score=0
-        for q in near:
-            t=q["text"].upper()
-            if self._is_dimension_token(t): score+=2
-            if self._is_gdt_token(t): score+=2
-            if re.search(r"(?:DATUM|A|B|C)$",t): score+=1
-            if re.search(r"(?:MM|IN|DEG|°)$",t): score+=2
-        # Isolated large text is much more likely to be a title/label.
-        if word["pw"]>.06*w or word["ph"]>.035*h: score-=2
-        return score
-
-    def _native_text_changes(self,bp,ap,before,after,diff,mapping):
-        old=self._native_words(bp); new=self._native_words(ap); h,w=before.shape[:2]
-        old_t=[x for x in old if self._target(x["text"],x["h"]*h)]; new_t=[x for x in new if self._target(x["text"],x["h"]*after.shape[0])]
-        for x in old_t:x["px"]=(x["x"]+x["w"]/2)*w; x["py"]=(x["y"]+x["h"]/2)*h; x["pw"]=x["w"]*w; x["ph"]=x["h"]*h
-        if not mapping:
-            return [],len(old),len(new),len(old_t),len(new_t),0
-        M=mapping[0]
-        for x in new_t:x.update(self._transform_word(x,M,before.shape))
-        # Build context over all native words, not only numeric candidates.
-        old_all=[]; new_all=[]
-        for x in old:
-            x={**x,"px":(x["x"]+x["w"]/2)*w,"py":(x["y"]+x["h"]/2)*h,"pw":x["w"]*w,"ph":x["h"]*h}; old_all.append(x)
-        for x in new:
-            x=self._transform_word(x,M,before.shape); new_all.append(x)
-        used=set(); candidates=[]; rejected=0
-        for o in old_t:
-            best=None; best_score=-999
-            for j,n in enumerate(new_t):
-                if j in used:continue
-                dx=abs(o["px"]-n["px"])/w; dy=abs(o["py"]-n["py"])/h; size=abs(np.log(max(o["pw"],1)/max(n["pw"],1)))
-                if dx>.018 or dy>.015 or size>.65:continue
-                # Same semantic class is required.
-                cls=lambda z: (self._is_gdt_token(z["text"]),self._is_dimension_token(z["text"]),self._is_note_token(z["text"]))
-                if cls(o)!=cls(n):continue
-                score=1-(dx*3+dy*3+min(size,.65)*.20)
-                if score>best_score:best_score,best=score,j
-            if best is None:continue
-            n=new_t[best]; used.add(best)
-            if self._norm(o["text"])==self._norm(n["text"]):continue
-            context=max(self._context_score(o,old_all,before.shape),self._context_score(n,new_all,before.shape))
-            # Crucial: standalone changed text is not a reportable drawing
-            # dimension. Require local engineering context.
-            if context<2:
-                rejected+=1; continue
-            x1=int(max(0,min(o["px"]-o["pw"]/2,n["px"]-n["pw"]/2)-max(10,int(.003*w)))); y1=int(max(0,min(o["py"]-o["ph"]/2,n["py"]-n["ph"]/2)-max(10,int(.003*h)))); x2=int(min(w,max(o["px"]+o["pw"]/2,n["px"]+n["pw"]/2)+max(10,int(.003*w)))); y2=int(min(h,max(o["py"]+o["ph"]/2,n["py"]+n["ph"]/2)+max(10,int(.003*h)))); local=diff[y1:y2,x1:x2]; ratio=float(np.mean(local>self.pixel_threshold)) if local.size else 0
-            if ratio>=.0015:candidates.append((x1,y1,x2-x1,y2-y1,.97))
-        return candidates,len(old),len(new),len(old_t),len(new_t),rejected
-
+    def _transform_point(x,y,M): return tuple((M[:,:2]@np.array([x,y])+M[:,2]).tolist())
+    def _word_px(self,w,shape,M=None):
+        h,ww=shape[:2]; p=np.array([(w["x"]+w["w"]/2)*ww,(w["y"]+w["h"]/2)*h]);
+        if M is not None:p=np.array(self._transform_point(*p,M))
+        return {**w,"px":float(p[0]),"py":float(p[1]),"pw":w["w"]*ww,"ph":w["h"]*h}
+    def _tile_words(self,words,box,shape,M=None):
+        h,w=shape[:2]; x0,y0,x1,y1=box; out=[]
+        for z in words:
+            q=self._word_px(z,shape,M)
+            if x0<=q["px"]<=x1 and y0<=q["py"]<=y1: out.append(q)
+        return out
+    def _best_tile_pairs(self,btiles,atiles,bwords,awords,bshape,ashape,M):
+        pairs=[]; used=set()
+        for bi,bt in enumerate(btiles):
+            bw=self._tile_words(bwords,bt,bshape); sig_b=self._tile_text_signature(bw)
+            best=None; bestscore=-1
+            for ai,at in enumerate(atiles):
+                if ai in used:continue
+                aw=self._tile_words(awords,at,ashape,M); sig_a=self._tile_text_signature(aw)
+                inter=sum(1 for x in sig_b for y in sig_a if x[0]==y[0] and self._norm(x[1])==self._norm(y[1]))
+                cls=sum(1 for x in sig_b for y in sig_a if x[0]==y[0])
+                # Visual tile signature is used as the anchor; text overlap is
+                # a bonus, not a requirement, so newly added text is supported.
+                bimg=self._tile_image(self._last_before,bt); aimg=self._tile_image(self._last_after,at)
+                vs=float(np.linalg.norm(self._tile_signature(bimg)-self._tile_signature(aimg))); visual=1/(1+vs/50)
+                score=.68*visual+.22*min(1,inter/3)+.10*min(1,cls/6)
+                if score>bestscore:bestscore,best=score,ai
+            if best is not None and bestscore>=.38:pairs.append((bi,best,bestscore)); used.add(best)
+        return pairs
+    @staticmethod
+    def _tile_text_signature(words): return sorted([(w["class"],w["text"]) for w in words])
+    def _tile_image(self,img,box): x0,y0,x1,y1=box; return img[y0:y1,x0:x1]
+    def _compare_tile_words(self,bw,aw,w,h,diff,origin):
+        # Match within the matched tile in aligned coordinates. Unmatched text
+        # becomes add/delete; changed text becomes change. No OCR dependency.
+        out=[]; used=set(); ox,oy=origin
+        for o in bw:
+            if o["class"]=="other":continue
+            best=None; score=-1
+            for j,n in enumerate(aw):
+                if j in used or n["class"]!=o["class"]:continue
+                dx=abs(o["px"]-n["px"])/w; dy=abs(o["py"]-n["py"])/h; sz=abs(np.log(max(o["pw"],1)/max(n["pw"],1)))
+                if dx>.020 or dy>.018 or sz>.75:continue
+                s=1-3*dx-3*dy-.2*min(sz,.75)
+                if s>score:score,best=s,j
+            if best is None:
+                out.append((o,None,"deleted"));continue
+            n=aw[best];used.add(best)
+            if self._norm(o["text"])!=self._norm(n["text"]):out.append((o,n,"changed"))
+        for j,n in enumerate(aw):
+            if j not in used and n["class"]!="other":out.append((None,n,"added"))
+        return out
     def detect(self,before_page,after_page,aligned_after=None):
         try:
-            before=self._img(before_page); after=self._img(after_page) if aligned_after is None else self._img(aligned_after); h,w=before.shape[:2]
+            before=self._img(before_page); raw_after=self._img(after_page); after=raw_after if aligned_after is None else self._img(aligned_after); h,w=before.shape[:2]
             if after.shape[:2]!=(h,w):after=cv2.resize(after,(w,h),interpolation=cv2.INTER_AREA)
-            gb=self._gray(before); ga=self._gray(after); diff=cv2.absdiff(gb,ga); _,mask=cv2.threshold(diff,self.pixel_threshold,255,cv2.THRESH_BINARY)
-            mapping=self._estimate_mapping(before,self._img(after_page)); native,nob,noa,notg,natg,rejected=self._native_text_changes(before_page,after_page,before,after,diff,mapping)
-            regions=[]
-            for x,y,rw,rh,conf in native:
-                d=diff[y:y+rh,x:x+rw]; regions.append(ChangeRegion(x,y,rw,rh,rw*rh,float(np.mean(d>self.pixel_threshold)),"dimension_or_gdt_or_note",conf,before[y:y+rh,x:x+rw].copy(),after[y:y+rh,x:x+rw].copy(),d.copy()))
-            reason=f"diag: native={nob}/{noa}, native_target={notg}/{natg}, text_mapping={'ok' if mapping else 'failed'}, raw_diff={float(np.mean(mask>0)):.5f}, native_candidates={len(native)}, context_rejected={rejected}, image_fallback=0, final={len(regions)}"
-            return ChangeDetectionResult(True,regions,diff,mask,float(np.mean(mask>0)),reason)
+            diff=cv2.absdiff(self._gray(before),self._gray(after)); _,mask=cv2.threshold(diff,self.pixel_threshold,255,cv2.THRESH_BINARY)
+            bw=self._native_words(before_page); aw=self._native_words(after_page); M=self._mapping(before,raw_after)
+            if M is None:return ChangeDetectionResult(True,[],diff,mask,float(np.mean(mask>0)),f"diag: native={len(bw)}/{len(aw)}, native_target={sum(x['class']!='other' for x in bw)}/{sum(x['class']!='other' for x in aw)}, text_mapping=failed, tiles=20, tile_pairs=0, candidates=0, added=0, deleted=0, final=0")
+            self._last_before=before; self._last_after=after; bt=self._tiles(before); at=self._tiles(after); pairs=self._best_tile_pairs(bt,at,bw,aw,before.shape,after.shape,M); candidates=[]; added=deleted=0
+            for bi,ai,ps in pairs:
+                bbox=bt[bi]; abox=at[ai]; bwt=self._tile_words(bw,bbox,before.shape); awt=self._tile_words(aw,abox,after.shape,M)
+                for o,n,kind in self._compare_tile_words(bwt,awt,w,h,diff,(bbox[0],bbox[1])):
+                    q=o or n; x=int(max(0,q["px"]-q["pw"]/2-14)); y=int(max(0,q["py"]-q["ph"]/2-14)); x2=int(min(w,q["px"]+q["pw"]/2+14)); y2=int(min(h,q["py"]+q["ph"]/2+14)); local=diff[y:y2,x:x2]
+                    if local.size and float(np.mean(local>self.pixel_threshold))<.001:continue
+                    candidates.append(ChangeRegion(x,y,x2-x,y2-y,(x2-x)*(y2-y),float(np.mean(local>self.pixel_threshold)) if local.size else 0,"dimension_or_gdt_or_note_"+kind,.80+0.15*ps,before[y:y2,x:x2].copy(),after[y:y2,x:x2].copy(),local.copy())); added+=kind=="added"; deleted+=kind=="deleted"
+            # Remove duplicates caused by overlapping tiles.
+            merged=[]
+            for r in candidates:
+                if any(self._iou((r.x,r.y,r.width,r.height),(m.x,m.y,m.width,m.height))>.35 for m in merged):continue
+                merged.append(r)
+            reason=f"diag: native={len(bw)}/{len(aw)}, native_target={sum(x['class']!='other' for x in bw)}/{sum(x['class']!='other' for x in aw)}, text_mapping=ok, tiles=20, tile_pairs={len(pairs)}, candidates={len(candidates)}, added={added}, deleted={deleted}, final={len(merged)}"
+            return ChangeDetectionResult(True,merged,diff,mask,float(np.mean(mask>0)),reason)
         except Exception as exc:return ChangeDetectionResult(False,[],reason=f"diag_error: {exc}")
