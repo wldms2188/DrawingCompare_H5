@@ -48,7 +48,9 @@ class DrawingCompareApp(tk.Tk):
                     self.status.set(f"비교 중... {bd.filename} p{bp.page_index+1}")
                     try: aligned=aligner.align(bp.image,ap.image)
                     except Exception as exc: self.write_log(f"정렬 경고: {exc}"); aligned=ap.image
-                    result=detector.detect(bp.image,aligned); self.write_log(f"검출 진단 p{bp.page_index+1}: {result.reason}")
+                    # Keep the original PageImage objects for native PDF text lookup,
+                    # while passing the aligned raster separately for pixel validation.
+                    result=detector.detect(bp,ap,aligned_after=aligned); self.write_log(f"검출 진단 p{bp.page_index+1}: {result.reason}")
                     for region_no,region in enumerate(result.regions,1):
                         stem=f"D{pair_no:02d}_P{bp.page_index+1:03d}_R{region_no:03d}"; old_path,new_path=capture_dir/f"{stem}_before.png",capture_dir/f"{stem}_after.png"; cv2.imwrite(str(old_path),self._to_bgr(region.old_crop)); cv2.imwrite(str(new_path),self._to_bgr(region.new_crop))
                         rows.append({"No":len(rows)+1,"Before PDF":bd.filename,"After PDF":ad.filename,"Before Page":bp.page_index+1,"After Page":ap.page_index+1,"Type":region.region_type,"Confidence":round(region.confidence,3),"X":region.x,"Y":region.y,"Width":region.width,"Height":region.height,"Change Ratio":round(region.change_ratio,4),"Before Image":str(old_path),"After Image":str(new_path)})
