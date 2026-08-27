@@ -7,9 +7,13 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   pretest:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,7 +26,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy opencv-python-headless pymupdf pytest openpyxl
+          pip install numpy opencv-python-headless pymupdf pytest openpyxl reportlab
 
       - name: Compile all Python modules
         run: python -m compileall -q .
