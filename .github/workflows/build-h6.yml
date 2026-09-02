@@ -1,0 +1,26 @@
+name: Build DrawingCompare H6
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'h6/**'
+      - '.github/workflows/build-h6.yml'
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: python -m pip install -r h6/requirements.txt
+      - name: Build EXE
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name DrawingCompare_H6 h6/main.py
+      - name: Smoke test imports
+        run: python -c "from h6.engine import H6Engine; print('H6 import OK')"
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: DrawingCompare_H6_Windows
+          path: dist/DrawingCompare_H6.exe
