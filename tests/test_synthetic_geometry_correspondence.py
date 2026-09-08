@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from core.change_detector_v2 import ChangeDetector
 from core.image_loader import ImageLoader
 from tools.generate_synthetic_drawings import AFTER, BEFORE, main as generate_dataset
@@ -9,7 +7,7 @@ def _find_region(result, kind):
     return [r for r in result.regions if r.change_kind == kind]
 
 
-def test_delta_geometry_change_is_local_and_corresponding(tmp_path):
+def test_delta_geometry_change_is_local_and_corresponding():
     generate_dataset()
 
     before_pdf = BEFORE / "synthetic_before.pdf"
@@ -31,10 +29,12 @@ def test_delta_geometry_change_is_local_and_corresponding(tmp_path):
     geometry = _find_region(result, "geometry_change")
     assert geometry, [(r.change_kind, r.old_text, r.new_text) for r in result.regions]
 
-    # The changed line is around the center of the DELTA drawing area.
+    # ReportLab uses a bottom-left origin; raster images use a top-left origin.
+    # The changed line runs through the center of the DELTA drawing area.
     H, W = before.pages[3].image.shape[:2]
     expected_x = (30 + 52) / 210
-    expected_y = (100 + 43.5) / 297
+    expected_y_from_bottom = (100 + 43.5) / 297
+    expected_y = 1.0 - expected_y_from_bottom
     px, py = expected_x * W, expected_y * H
 
     def contains(r):
