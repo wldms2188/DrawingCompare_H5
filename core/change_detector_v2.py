@@ -35,11 +35,12 @@ class ChangeDetectionResult:
     def region(self): return self.regions
 
 class ChangeDetector:
-    """Native-PDF-word comparison. Coordinates stay in raw-page space until raster crops."""
+    """Native-PDF-word comparison with conservative semantic merging."""
     def __init__(self, config=None):
         self.pixel_threshold=35
         self.max_word_distance_ratio=.035
         self.min_confidence=.55
+        self.merge_gap=24
 
     @staticmethod
     def _img(page):
@@ -70,7 +71,6 @@ class ChangeDetector:
 
     @staticmethod
     def _value_like(text):
-        """True for engineering values/codes where old->new is a value change, not add/delete."""
         u=str(text).strip().upper()
         if not u: return False
         if re.search(r'±|Ø|⌀|^R\s*[-+]?\d|^[-+]?\d+(?:\.\d+)?$',u): return True
@@ -97,7 +97,7 @@ class ChangeDetector:
         p=np.array([x,y,1.],dtype=np.float32); q=np.asarray(M,dtype=np.float32).reshape(2,3)@p; return float(q[0]),float(q[1])
 
     def _mapped_words(self,words,after_shape,view_shape,M):
-        H,W=after_shape[:2]; HV,WV=view_shape[:2]; out=[]
+        H,W=after_shape[:2]; out=[]
         for q in words:
             pts=[self._affine_point(q['x']*W,q['y']*H,M),self._affine_point((q['x']+q['w'])*W,(q['y']+q['h'])*H,M)]
             x=min(a[0] for a in pts); y=min(a[1] for a in pts); xx=max(a[0] for a in pts); yy=max(a[1] for a in pts)
@@ -123,7 +123,7 @@ class ChangeDetector:
                 size=max(o['h'],n['h'])/max(1,min(o['h'],n['h']))
                 if size>2.2: continue
                 text_bonus=0 if self._norm(o['text'])==self._norm(n['text']) else -0.25
-                cand.append((d/(maxd)+text_bonus,i,j))
+                cand.append((d/maxd+text_bonus,i,j))
         cand.sort(); used_o=set(); used_n=set(); pairs=[]
         for score,i,j in cand:
             if i in used_o or j in used_n: continue
@@ -137,39 +137,63 @@ class ChangeDetector:
                                     self._crop(after,b) if new_text else blank.copy(),
                                     None,old_text,new_text,kind))
 
+    def _mergeable(self,a,b):
+        if a.change_kind != b.change_kind: return False
+        if a.change_kind == 'geometry_change': return False
+        ax,ay,axx,ayy=a.x,a.y,a.x+a.width,a.y+a.height; bx,by,bxx,byy=b.x,b.y,b.x+b.width,b.y+b.height
+        gapx=max(0,max(ax,bx)-min(axx,bxx)); gapy=max(0,max(ay,by)-min(ayy,byy))
+        overlap_x=max(0,min(axx,bxx)-max(ax,bx)); overlap_y=max(0,min(ayy,byy)-max(ay,by))
+        return (gapx<=self.merge_gap and overlap_y>0) or (gapy<=self.merge_gap and overlap_x>0) or self._iou(Box(ax,ay,a.width,a.height),Box(bx,by,b.width,b.height))>.05
+
+    def _merge_regions(self,regions,before,after):
+        """Merge only adjacent regions of the same semantic change kind.
+        This is deliberately not a global tile/connected-component merge.
+        """
+        pending=list(regions); changed=True
+        while changed:
+            changed=False; out=[]
+            while pending:
+                cur=pending.pop(0); merged=False
+                for i,other in enumerate(pending):
+                    if not self._mergeable(cur,other): continue
+                    x=min(cur.x,other.x); y=min(cur.y,other.y); xx=max(cur.x+cur.width,other.x+other.width); yy=max(cur.y+cur.height,other.y+other.height)
+                    box=Box(x,y,xx-x,yy-y)
+                    old_text=' '.join(t for t in (cur.old_text,other.old_text) if t).strip()
+                    new_text=' '.join(t for t in (cur.new_text,other.new_text) if t).strip()
+                    cur=ChangeRegion(x,y,xx-x,yy-y,(xx-x)*(yy-y),0.0,cur.region_type,max(cur.confidence,other.confidence),
+                                     self._crop(before,box) if old_text else np.full((box.h,box.w,3),255,np.uint8),
+                                     self._crop(after,box) if new_text else np.full((box.h,box.w,3),255,np.uint8),
+                                     None,old_text,new_text,cur.change_kind)
+                    pending.pop(i); merged=True; changed=True; break
+                if not merged: out.append(cur)
+            pending=out
+        return pending
+
     def detect(self,before_page,after_page,aligned_after=None,alignment_matrix=None):
         try:
             before=self._img(before_page); after=self._img(aligned_after if aligned_after is not None else after_page); H,W=before.shape[:2]
-            old=self._words(before_page); raw_new=self._words(after_page)
-            M=alignment_matrix
+            old=self._words(before_page); raw_new=self._words(after_page); M=alignment_matrix
             if M is not None:
                 new=self._mapped_words(raw_new,self._img(after_page).shape,after.shape,M)
             else:
                 ah,aw=self._img(after_page).shape[:2]; sx=W/max(1,aw); sy=H/max(1,ah)
                 new=[{**q,'x':q['x']*aw*sx,'y':q['y']*ah*sy,'w':q['w']*aw*sx,'h':q['h']*ah*sy,'cx':q['cx']*aw*sx,'cy':q['cy']*ah*sy} for q in raw_new]
             oldpx=[{**q,'x':q['x']*W,'y':q['y']*H,'w':q['w']*W,'h':q['h']*H,'cx':q['cx']*W,'cy':q['cy']*H} for q in old]
-            pairs,used_o,used_n=self._pair_words(oldpx,new,W,H)
-            regions=[]
+            pairs,used_o,used_n=self._pair_words(oldpx,new,W,H); regions=[]
             for o,n,score in pairs:
                 if self._norm(o['text'])==self._norm(n['text']): continue
-                cls=o['class']; ob=self._box(o,10,W,H); nb=self._box(n,10,W,H)
-                x=min(ob.x,nb.x); y=min(ob.y,nb.y); xx=max(ob.x+ob.w,nb.x+nb.w); yy=max(ob.y+ob.h,nb.y+nb.h); b=Box(x,y,xx-x,yy-y).pad(8,W,H)
-                conf=max(.55,min(.99,1-score))
+                cls=o['class']; ob=self._box(o,10,W,H); nb=self._box(n,10,W,H); x=min(ob.x,nb.x); y=min(ob.y,nb.y); xx=max(ob.x+ob.w,nb.x+nb.w); yy=max(ob.y+ob.h,nb.y+nb.h); b=Box(x,y,xx-x,yy-y).pad(8,W,H); conf=max(.55,min(.99,1-score))
                 if cls in ('NOTE','TEXT') and not (self._value_like(o['text']) and self._value_like(n['text'])):
-                    okind='note_deleted' if cls=='NOTE' else 'text_deleted'; nkind='note_added' if cls=='NOTE' else 'text_added'
-                    self._add_region(regions,before,after,ob,okind,o['text'],'',conf)
-                    self._add_region(regions,before,after,nb,nkind,'',n['text'],conf)
+                    okind='note_deleted' if cls=='NOTE' else 'text_deleted'; nkind='note_added' if cls=='NOTE' else 'text_added'; self._add_region(regions,before,after,ob,okind,o['text'],'',conf); self._add_region(regions,before,after,nb,nkind,'',n['text'],conf)
                 else:
-                    typ={'DIMENSION':'dimension_change','GDT':'gdt_change','NOTE':'note_change','TEXT':'text_change'}[cls]
-                    regions.append(ChangeRegion(b.x,b.y,b.w,b.h,b.w*b.h,0,typ,conf,self._crop(before,b),self._crop(after,b),None,o['text'],n['text'],typ))
+                    typ={'DIMENSION':'dimension_change','GDT':'gdt_change','NOTE':'note_change','TEXT':'text_change'}[cls]; regions.append(ChangeRegion(b.x,b.y,b.w,b.h,b.w*b.h,0,typ,conf,self._crop(before,b),self._crop(after,b),None,o['text'],n['text'],typ))
             matched_boxes=[self._box(o,28,W,H) for o,_,_ in pairs]+[self._box(n,28,W,H) for _,n,_ in pairs]
             for side,words,used in [('deleted',oldpx,used_o),('added',new,used_n)]:
                 for i,q in enumerate(words):
                     if i in used: continue
                     qb=self._box(q,10,W,H)
                     if not any(self._iou(qb,m)>0.02 or (abs(q['cx']-(m.x+m.w/2))<max(35,m.w) and abs(q['cy']-(m.y+m.h/2))<max(35,m.h)) for m in matched_boxes): continue
-                    cls=q['class']; typ={'DIMENSION':'dimension_added' if side=='added' else 'dimension_deleted','GDT':'gdt_added' if side=='added' else 'gdt_deleted','NOTE':'note_added' if side=='added' else 'note_deleted','TEXT':'text_added' if side=='added' else 'text_deleted'}[cls]
-                    b=qb.pad(8,W,H); self._add_region(regions,before,after,b,typ,q['text'] if side=='deleted' else '',q['text'] if side=='added' else '',.65)
+                    cls=q['class']; typ={'DIMENSION':'dimension_added' if side=='added' else 'dimension_deleted','GDT':'gdt_added' if side=='added' else 'gdt_deleted','NOTE':'note_added' if side=='added' else 'note_deleted','TEXT':'text_added' if side=='added' else 'text_deleted'}[cls]; b=qb.pad(8,W,H); self._add_region(regions,before,after,b,typ,q['text'] if side=='deleted' else '',q['text'] if side=='added' else '',.65)
             if before.shape[:2]==after.shape[:2]:
                 a=self._gray(before); bgray=self._gray(after); d=cv2.absdiff(a,bgray); _,th=cv2.threshold(d,self.pixel_threshold,255,cv2.THRESH_BINARY); th=cv2.morphologyEx(th,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8)); n,_,stats,_=cv2.connectedComponentsWithStats(th,8)
                 for k in range(1,n):
@@ -178,11 +202,12 @@ class ChangeDetector:
                     b=Box(int(x),int(y),int(w),int(h)).pad(8,W,H)
                     if any(self._iou(b,Box(r.x,r.y,r.width,r.height))>.15 for r in regions): continue
                     regions.append(ChangeRegion(b.x,b.y,b.w,b.h,b.w*b.h,area/max(1,b.w*b.h),'geometry_change',.60,self._crop(before,b),self._crop(after,b),self._crop(d,b),'','', 'geometry_change'))
-            final=[]
-            for r in sorted(regions,key=lambda z:(z.confidence,z.area),reverse=True):
+            before_merge=len(regions); final=self._merge_regions(regions,before,after)
+            final2=[]
+            for r in sorted(final,key=lambda z:(z.confidence,z.area),reverse=True):
                 rb=Box(r.x,r.y,r.width,r.height)
-                if not any(self._iou(rb,Box(q.x,q.y,q.width,q.height))>.60 for q in final): final.append(r)
-            reason=f'v2 native={len(old)}/{len(raw_new)}, pairs={len(pairs)}, changed_values={sum(1 for r in final if r.change_kind.endswith("change") and r.change_kind!="geometry_change")}, unmatched={len(old)-len(used_o)}/{len(raw_new)-len(used_n)}, final={len(final)}'
-            return ChangeDetectionResult(True,final,None,None,0.0,reason)
+                if not any(self._iou(rb,Box(q.x,q.y,q.width,q.height))>.60 for q in final2): final2.append(r)
+            reason=f'v2 native={len(old)}/{len(raw_new)}, pairs={len(pairs)}, raw_regions={before_merge}, merged_regions={len(final)}, final={len(final2)}, unmatched={len(old)-len(used_o)}/{len(raw_new)-len(used_n)}'
+            return ChangeDetectionResult(True,final2,None,None,0.0,reason)
         except Exception as exc:
             return ChangeDetectionResult(False,[],reason=f'v2_error: {type(exc).__name__}: {exc}')
