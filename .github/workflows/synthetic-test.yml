@@ -16,4 +16,19 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip && pip install pytest numpy opencv-python-headless==4.10.0.84 PyMuPDF reportlab openpyxl pillow
       - name: Run synthetic regression
-        run: python -m pytest -q tests/test_synthetic_compare.py tests/test_multipage_pipeline.py
+        run: python -m pytest -q tests/test_synthetic_compare.py tests/test_multipage_pipeline.py tests/test_synthetic_dataset_generator.py
+      - name: Generate sample drawings
+        run: python tools/generate_synthetic_drawings.py
+      - name: Verify generated PDFs
+        run: python - <<'PY'
+          from pathlib import Path
+          from core.image_loader import ImageLoader
+          root = Path('synthetic_dataset')
+          before = root / 'Before' / 'synthetic_before.pdf'
+          after = root / 'After' / 'synthetic_after.pdf'
+          assert before.exists() and after.exists()
+          loader = ImageLoader()
+          assert loader.load_pdf(before).page_count == 4
+          assert loader.load_pdf(after).page_count == 4
+          print('synthetic dataset OK')
+          PY
