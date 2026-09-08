@@ -25,8 +25,8 @@ def _word_center(pdf_path, page_index, text):
     return hits[0]
 
 
-def _contains_norm_point(region, point, image_shape, margin=0.035):
-    H, W = image_shape[:2]
+def _contains_norm_point(region, point, reference_shape, margin=0.035):
+    H, W = reference_shape[:2]
     x, y = point[0] * W, point[1] * H
     return (
         region.x - margin * W <= x <= region.x + region.width + margin * W
@@ -73,12 +73,11 @@ def test_synthetic_crops_are_corresponding_semantic_locations(tmp_path):
 
         old_point = _word_center(before_pdf, before_idx, old_text)
         new_point = _word_center(after_pdf, after_idx, new_text)
-        assert _contains_norm_point(region, old_point, before.pages[before_idx].image.shape), (
-            old_text, region
-        )
-        assert _contains_norm_point(region, new_point, after.pages[after_idx].image.shape), (
-            new_text, region
-        )
+        # The detector expresses both sides in BEFORE_RASTER coordinates when
+        # no explicit alignment matrix is supplied. Compare normalized PDF
+        # locations against the BEFORE raster, never raw after-pixel coords.
+        assert _contains_norm_point(region, old_point, before.pages[before_idx].image.shape), old_text
+        assert _contains_norm_point(region, new_point, before.pages[before_idx].image.shape), new_text
 
         H, W = before.pages[before_idx].image.shape[:2]
         assert 0 < region.width < W * 0.35
@@ -96,7 +95,6 @@ def test_synthetic_note_and_add_delete_crops_stay_local(tmp_path):
     loader = ImageLoader()
     before = loader.load_pdf(before_pdf)
     after = loader.load_pdf(after_pdf)
-    matches = PageMatcher().match_pages(before, after)
     detector = ChangeDetector()
 
     alpha = detector.detect(before.pages[0], after.pages[3], aligned_after=after.pages[3].image, alignment_matrix=None)
