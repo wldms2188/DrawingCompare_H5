@@ -1,0 +1,17 @@
+{
+  "description": "DrawingCompare_H5 synthetic regression test",
+  "expected_changes": [
+    {"before": "25", "after": "30", "kind": "dimension"},
+    {"before": "0.05", "after": "0.10", "kind": "gdt"},
+    {"before": "AL6061", "after": "AL7075", "kind": "note"},
+    {"before": "Ø8", "after": "Ø10", "kind": "dimension"}
+  ],
+  "false_positive_regions": ["FIXED AREA"],
+  "acceptance": {
+    "minimum_expected_changes_found": 4,
+    "maximum_unexpected_change_regions": 0,
+    "crop_must_contain_changed_value": true,
+    "no_global_text_fallback": true,
+    "no_fixed_tile_split": true
+  }
+}
