@@ -35,7 +35,7 @@ class DrawingCompareApp(tk.Tk):
             output_dir.mkdir(parents=True,exist_ok=True); loader=ImageLoader(); before_docs=loader.load_folder(before_dir); after_docs=loader.load_folder(after_dir)
             if not before_docs or not after_docs: raise RuntimeError("Before 또는 After 폴더에 읽을 수 있는 PDF가 없습니다.")
             self.write_log(f"Before PDF {len(before_docs)}개 / After PDF {len(after_docs)}개")
-            pairs=self._match_documents(before_docs,after_docs); page_cfg=CONFIG.page_match if hasattr(CONFIG,"page_match") else type("PageCfg",(),{"minimum_score":0.55,"review_score":0.40,"minimum_feature_matches":8})(); page_matcher=PageMatcher(type("Cfg",(),{"page_match":page_cfg})()); aligner,detector=AutoAlign(),ChangeDetector(); rows=[]; capture_dir=output_dir/"captures"; capture_dir.mkdir(parents=True,exist_ok=True)
+            pairs=self._match_documents(before_docs,after_docs); page_cfg=CONFIG.page_match if hasattr(CONFIG,"page_match") else type("PageCfg",(),{"minimum_score":0.55,"review_score":0.40,"minimum_feature_matches":8})(); page_matcher=PageMatcher(type("Cfg",(),{"page_match":page_cfg})()); aligner,detector=AutoAlign(max_rotation_deg=2.0),ChangeDetector(); rows=[]; capture_dir=output_dir/"captures"; capture_dir.mkdir(parents=True,exist_ok=True)
             for pair_no,(bd,ad) in enumerate(pairs,1):
                 page_matches=page_matcher.match_pages(bd,ad); self.write_log(f"문서 {pair_no}: {bd.filename} ↔ {ad.filename}, 페이지 후보 {len(page_matches)}개")
                 for pm in page_matches:
@@ -43,7 +43,16 @@ class DrawingCompareApp(tk.Tk):
                     bp,ap=pm.before_page,pm.after_page; self.status.set(f"비교 중... {bd.filename} p{bp.page_index+1}")
                     try:
                         alignment=aligner.align(bp.image,ap.image)
-                        if isinstance(alignment, AlignmentResult): aligned=alignment.image; matrix=alignment.matrix; self.write_log(f"정렬: {alignment.method}, success={alignment.success}, scale={alignment.scale:.3f}, rotation={alignment.rotation:.2f}°, valid={alignment.valid_ratio:.2f}")
+                        if isinstance(alignment, AlignmentResult):
+                            aligned=alignment.image; matrix=alignment.matrix
+                            # AutoAlign resizes a differently-sized After page to the Before
+                            # raster before estimating its matrix. Convert that matrix back to
+                            # raw-After coordinates before native PDF words are mapped.
+                            if matrix is not None and ap.image.shape[:2] != bp.image.shape[:2]:
+                                ah,aw=ap.image.shape[:2]; vh,vw=aligned.shape[:2]
+                                S=np.array([[vw/max(1,aw),0,0],[0,vh/max(1,ah),0],[0,0,1]],dtype=np.float32)
+                                matrix=(np.asarray(matrix,dtype=np.float32).reshape(2,3) @ S)[:2]
+                            self.write_log(f"정렬: {alignment.method}, success={alignment.success}, scale={alignment.scale:.3f}, rotation={alignment.rotation:.2f}°, valid={alignment.valid_ratio:.2f}")
                         else: aligned=alignment; matrix=None
                     except Exception as exc: self.write_log(f"정렬 경고: {exc}"); aligned=ap.image; matrix=None
                     result=detector.detect(bp,ap,aligned_after=aligned,alignment_matrix=matrix); self.write_log(f"검출 진단 p{bp.page_index+1}: {result.reason}")
