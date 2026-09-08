@@ -15,8 +15,8 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install --upgrade pip && pip install pytest numpy opencv-python-headless==4.10.0.84 PyMuPDF reportlab openpyxl pillow
-      - name: Run synthetic regression
-        run: python -m pytest -q tests/test_synthetic_compare.py tests/test_multipage_pipeline.py tests/test_synthetic_dataset_generator.py
+      - name: Run semantic and crop regression
+        run: python -m pytest -q tests/test_synthetic_compare.py tests/test_multipage_pipeline.py tests/test_synthetic_dataset_generator.py tests/test_synthetic_crop_correspondence.py
       - name: Generate sample drawings
         run: python tools/generate_synthetic_drawings.py
       - name: Verify generated PDFs
