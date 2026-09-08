@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, List
+from typing import List
 import re
 import cv2
 import numpy as np
@@ -20,18 +20,17 @@ class SemanticRegionBuilder:
     Priority: explicit rectangular/NOTE containers -> GD&T/dimension groups ->
     remaining drawing components. All boxes are xywh in the source image.
     """
-    NOTE_RE=re.compile(r'\b(?:NOTE|NOTES|UNLESS|MATERIAL|FINISH|REMOVE|BURR|INSPECT|TYP|SEE)\b',re.I)
+    NOTE_RE=re.compile(r'\b(?:NOTE|NOTES|UNLESS|MATERIAL|FINISH|BURR|INSPECT|TYP|SEE)\b',re.I)
     GD_RE=re.compile(r'(?:POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC|⌀|Ø|±|⌖|⌯|⏥|⌒|∥|⊥)',re.I)
     DIM_RE=re.compile(r'^(?:[RMD]\s*)?(?:Ø|⌀)?\d+(?:\.\d+)?(?:\s*[A-Z°]+)?$')
     def build(self,image:np.ndarray,words:List[dict]) -> List[SemanticRegion]:
         H,W=image.shape[:2]; out=[]
         boxes=self._containers(image)
-        used=set()
         for b in boxes:
             inside=self._words_in(words,b,W,H)
             txt=' '.join(w['text'] for w in inside)
             kind='NOTE' if self.NOTE_RE.search(txt) else ('GD&T' if any(self.GD_RE.search(w['text']) for w in inside) else 'BOX')
-            out.append(SemanticRegion(*b,kind,inside,.95)); used.update(id(w) for w in inside)
+            out.append(SemanticRegion(*b,kind,inside,.95))
         special=[w for w in words if self._special(w)]
         out.extend(self._group_special(special,W,H,out))
         return self._merge(out,W,H)
