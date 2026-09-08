@@ -14,6 +14,6 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && pip install pytest numpy opencv-python-headless PyMuPDF reportlab openpyxl pillow
+        run: python -m pip install --upgrade pip && pip install pytest numpy opencv-python-headless==4.10.0.84 PyMuPDF reportlab openpyxl pillow
       - name: Run synthetic regression
         run: python -m pytest -q tests/test_synthetic_compare.py tests/test_multipage_pipeline.py
