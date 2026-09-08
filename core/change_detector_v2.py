@@ -35,7 +35,7 @@ class ChangeDetectionResult:
     def region(self): return self.regions
 
 class ChangeDetector:
-    """Native-PDF-word comparison. Coordinates are normalized on the raw PDF page until raster crops are made."""
+    """Native-PDF-word comparison. Coordinates stay in raw-page space until raster crops."""
     def __init__(self, config=None):
         self.pixel_threshold=35
         self.max_word_distance_ratio=.035
@@ -68,6 +68,15 @@ class ChangeDetector:
         if re.search(r'±|Ø|⌀|\bR\s*\d|^\d+(?:\.\d+)?$',u): return 'DIMENSION'
         return 'TEXT'
 
+    @staticmethod
+    def _value_like(text):
+        """True for engineering values/codes where old->new is a value change, not add/delete."""
+        u=str(text).strip().upper()
+        if not u: return False
+        if re.search(r'±|Ø|⌀|^R\s*[-+]?\d|^[-+]?\d+(?:\.\d+)?$',u): return True
+        if re.fullmatch(r'[A-Z]{1,8}[-_/]?[A-Z0-9]{2,12}',u) and re.search(r'\d',u): return True
+        return False
+
     def _words(self,page):
         try:
             import fitz
@@ -90,10 +99,8 @@ class ChangeDetector:
     def _mapped_words(self,words,after_shape,view_shape,M):
         H,W=after_shape[:2]; HV,WV=view_shape[:2]; out=[]
         for q in words:
-            pts=[self._affine_point(q['x']*W,q['y']*H,M),self._affine_point((q['x']+q['w'])*W,(q['y']+q['h'])*H,M)] if M is not None else [(q['x']*W,q['y']*H),((q['x']+q['w'])*W,(q['y']+q['h'])*H)]
-            x=min(a[0] for a in pts)*WV/max(1,WV if M is None else W); y=min(a[1] for a in pts)*HV/max(1,HV if M is None else H); xx=max(a[0] for a in pts)*WV/max(1,WV if M is None else W); yy=max(a[1] for a in pts)*HV/max(1,HV if M is None else H)
-            # For an affine matrix from raw after pixels to before/view pixels, use direct pixel coordinates.
-            if M is not None: x=min(a[0] for a in pts); y=min(a[1] for a in pts); xx=max(a[0] for a in pts); yy=max(a[1] for a in pts)
+            pts=[self._affine_point(q['x']*W,q['y']*H,M),self._affine_point((q['x']+q['w'])*W,(q['y']+q['h'])*H,M)]
+            x=min(a[0] for a in pts); y=min(a[1] for a in pts); xx=max(a[0] for a in pts); yy=max(a[1] for a in pts)
             out.append({**q,'x':x,'y':y,'w':max(1,xx-x),'h':max(1,yy-y),'cx':(x+xx)/2,'cy':(y+yy)/2})
         return out
 
@@ -123,13 +130,24 @@ class ChangeDetector:
             used_o.add(i); used_n.add(j); pairs.append((old[i],new[j],score))
         return pairs,used_o,used_n
 
+    def _region_for_word(self,q,pad,W,H):
+        b=self._box(q,pad,W,H)
+        return b
+
+    def _add_region(self,regions,before,after,b,kind,old_text='',new_text='',confidence=.65):
+        blank=np.full((b.h,b.w,3),255,np.uint8)
+        regions.append(ChangeRegion(b.x,b.y,b.w,b.h,b.w*b.h,0.0,kind,confidence,
+                                    self._crop(before,b) if old_text else blank.copy(),
+                                    self._crop(after,b) if new_text else blank.copy(),
+                                    None,old_text,new_text,kind))
+
     def detect(self,before_page,after_page,aligned_after=None,alignment_matrix=None):
         try:
             before=self._img(before_page); after=self._img(aligned_after if aligned_after is not None else after_page); H,W=before.shape[:2]
             old=self._words(before_page); raw_new=self._words(after_page)
             M=alignment_matrix
-            # AutoAlign's matrix is treated as raw-after-pixel -> aligned-view-pixel. If unavailable, map by image dimensions.
-            if M is not None: new=self._mapped_words(raw_new,self._img(after_page).shape,after.shape,M)
+            if M is not None:
+                new=self._mapped_words(raw_new,self._img(after_page).shape,after.shape,M)
             else:
                 ah,aw=self._img(after_page).shape[:2]; sx=W/max(1,aw); sy=H/max(1,ah)
                 new=[{**q,'x':q['x']*aw*sx,'y':q['y']*ah*sy,'w':q['w']*aw*sx,'h':q['h']*ah*sy,'cx':q['cx']*aw*sx,'cy':q['cy']*ah*sy} for q in raw_new]
@@ -138,18 +156,26 @@ class ChangeDetector:
             regions=[]
             for o,n,score in pairs:
                 if self._norm(o['text'])==self._norm(n['text']): continue
-                cls=o['class']; typ={'DIMENSION':'dimension_change','GDT':'gdt_change','NOTE':'note_change','TEXT':'text_change'}[cls]
-                ob=self._box(o,10,W,H); nb=self._box(n,10,W,H); x=min(ob.x,nb.x); y=min(ob.y,nb.y); xx=max(ob.x+ob.w,nb.x+nb.w); yy=max(ob.y+ob.h,nb.y+nb.h); b=Box(x,y,xx-x,yy-y).pad(8,W,H)
-                conf=max(.55,min(.99,1-score)); regions.append(ChangeRegion(b.x,b.y,b.w,b.h,b.w*b.h,0,typ,conf,self._crop(before,b),self._crop(after,b),None,o['text'],n['text'],typ))
-            # Unmatched words are only considered near an already matched semantic area; no global fallback.
+                cls=o['class']; ob=self._box(o,10,W,H); nb=self._box(n,10,W,H)
+                x=min(ob.x,nb.x); y=min(ob.y,nb.y); xx=max(ob.x+ob.w,nb.x+nb.w); yy=max(ob.y+ob.h,nb.y+nb.h); b=Box(x,y,xx-x,yy-y).pad(8,W,H)
+                conf=max(.55,min(.99,1-score))
+                # Free-form NOTE/TEXT replacements are semantically a deletion + addition.
+                # Engineering numeric/material codes remain a single changed-value record.
+                if cls in ('NOTE','TEXT') and not (self._value_like(o['text']) and self._value_like(n['text'])):
+                    okind='note_deleted' if cls=='NOTE' else 'text_deleted'; nkind='note_added' if cls=='NOTE' else 'text_added'
+                    self._add_region(regions,before,after,ob,okind,o['text'],'',conf)
+                    self._add_region(regions,before,after,nb,nkind,'',n['text'],conf)
+                else:
+                    typ={'DIMENSION':'dimension_change','GDT':'gdt_change','NOTE':'note_change','TEXT':'text_change'}[cls]
+                    regions.append(ChangeRegion(b.x,b.y,b.w,b.h,b.w*b.h,0,typ,conf,self._crop(before,b),self._crop(after,b),None,o['text'],n['text'],typ))
             matched_boxes=[self._box(o,28,W,H) for o,_,_ in pairs]+[self._box(n,28,W,H) for _,n,_ in pairs]
             for side,words,used in [('deleted',oldpx,used_o),('added',new,used_n)]:
                 for i,q in enumerate(words):
                     if i in used: continue
                     qb=self._box(q,10,W,H)
                     if not any(self._iou(qb,m)>0.02 or (abs(q['cx']-(m.x+m.w/2))<max(35,m.w) and abs(q['cy']-(m.y+m.h/2))<max(35,m.h)) for m in matched_boxes): continue
-                    cls=q['class']; typ={'DIMENSION':'dimension_added' if side=='added' else 'dimension_deleted','GDT':'gdt_added' if side=='added' else 'gdt_deleted','NOTE':'note_added' if side=='added' else 'note_deleted','TEXT':'text_added' if side=='added' else 'text_deleted'}[cls]; b=qb.pad(8,W,H); regions.append(ChangeRegion(b.x,b.y,b.w,b.h,b.w*b.h,0,typ,.65,self._crop(before,b) if side=='deleted' else np.full((b.h,b.w,3),255,np.uint8),self._crop(after,b) if side=='added' else np.full((b.h,b.w,3),255,np.uint8),None,q['text'] if side=='deleted' else '',q['text'] if side=='added' else '',typ))
-            # Pixel differences are only used when native text did not already explain the area.
+                    cls=q['class']; typ={'DIMENSION':'dimension_added' if side=='added' else 'dimension_deleted','GDT':'gdt_added' if side=='added' else 'gdt_deleted','NOTE':'note_added' if side=='added' else 'note_deleted','TEXT':'text_added' if side=='added' else 'text_deleted'}[cls]
+                    b=qb.pad(8,W,H); self._add_region(regions,before,after,b,typ,q['text'] if side=='deleted' else '',q['text'] if side=='added' else '',.65)
             if before.shape[:2]==after.shape[:2]:
                 a=self._gray(before); bgray=self._gray(after); d=cv2.absdiff(a,bgray); _,th=cv2.threshold(d,self.pixel_threshold,255,cv2.THRESH_BINARY); th=cv2.morphologyEx(th,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8)); n,_,stats,_=cv2.connectedComponentsWithStats(th,8)
                 for k in range(1,n):
