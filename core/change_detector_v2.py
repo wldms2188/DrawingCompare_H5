@@ -7,12 +7,9 @@ import numpy as np
 
 @dataclass(frozen=True)
 class Box:
-    x: int
-    y: int
-    w: int
-    h: int
-    def xyxy(self): return self.x, self.y, self.x + self.w, self.y + self.h
-    def pad(self, p: int, W: int, H: int):
+    x:int; y:int; w:int; h:int
+    def xyxy(self): return self.x,self.y,self.x+self.w,self.y+self.h
+    def pad(self,p:int,W:int,H:int):
         x=max(0,self.x-p); y=max(0,self.y-p); xx=min(W,self.x+self.w+p); yy=min(H,self.y+self.h+p)
         return Box(x,y,max(1,xx-x),max(1,yy-y))
 
@@ -35,12 +32,21 @@ class ChangeDetectionResult:
     def region(self): return self.regions
 
 class ChangeDetector:
-    """Native-PDF-word comparison with conservative semantic merging."""
+    """Vector/native semantic comparison plus structural line correspondence.
+
+    Geometry detection intentionally does NOT use a page-wide pixel-diff fallback.
+    Native PDF words locate text/value changes; long structural line segments locate
+    real drawing-geometry changes. This prevents alignment residuals and title-block
+    text from becoming arbitrary change regions.
+    """
     def __init__(self, config=None):
         self.pixel_threshold=35
         self.max_word_distance_ratio=.035
-        self.min_confidence=.55
         self.merge_gap=24
+        self.min_line_length_ratio=.018
+        self.line_position_ratio=.035
+        self.line_angle_deg=9.0
+        self.line_length_ratio=.30
 
     @staticmethod
     def _img(page):
@@ -137,18 +143,96 @@ class ChangeDetector:
                                     self._crop(after,b) if new_text else blank.copy(),
                                     None,old_text,new_text,kind))
 
+    def _text_mask(self,words,W,H,pad=8):
+        mask=np.zeros((H,W),np.uint8)
+        for q in words:
+            b=self._box(q,pad,W,H); x,y,xx,yy=b.x,b.y,b.x+b.w,b.y+b.h
+            cv2.rectangle(mask,(x,y),(xx,yy),255,-1)
+        return mask
+
+    @staticmethod
+    def _line_info(lines):
+        out=[]
+        if lines is None: return out
+        for l in lines[:,0]:
+            x1,y1,x2,y2=map(int,l); dx=x2-x1; dy=y2-y1; length=float(np.hypot(dx,dy))
+            if length<=0: continue
+            angle=float(np.degrees(np.arctan2(dy,dx)))%180
+            out.append({'x1':x1,'y1':y1,'x2':x2,'y2':y2,'cx':(x1+x2)/2,'cy':(y1+y2)/2,'length':length,'angle':angle})
+        return out
+
+    def _structural_lines(self,img,words):
+        """Return long drawing lines while suppressing text and page/title borders."""
+        H,W=img.shape[:2]; g=self._gray(img); edge=cv2.Canny(g,45,150)
+        text_mask=self._text_mask(words,W,H,pad=7); edge[text_mask>0]=0
+        # Page border/title-block lines are not meaningful geometry changes.
+        edge[:max(2,int(H*.035)),:]=0; edge[int(H*.965):,:]=0
+        edge[:,:max(2,int(W*.02))]=0; edge[:,int(W*.98):]=0
+        min_len=max(35,int(min(W,H)*self.min_line_length_ratio))
+        lines=cv2.HoughLinesP(edge,1,np.pi/180,threshold=max(28,int(min(W,H)*.012)),minLineLength=min_len,maxLineGap=10)
+        info=self._line_info(lines)
+        # Deduplicate nearly identical Hough fragments.
+        kept=[]
+        for q in sorted(info,key=lambda z:z['length'],reverse=True):
+            if any(abs(q['cx']-r['cx'])<8 and abs(q['cy']-r['cy'])<8 and abs(q['angle']-r['angle'])<5 and abs(q['length']-r['length'])<max(12,.12*r['length']) for r in kept): continue
+            kept.append(q)
+        return kept[:300]
+
+    def _line_pair(self,a,b,W,H):
+        pos=max(W,H)*self.line_position_ratio
+        d=float(np.hypot(a['cx']-b['cx'],a['cy']-b['cy']))
+        da=abs(a['angle']-b['angle']); da=min(da,180-da)
+        lr=abs(a['length']-b['length'])/max(a['length'],b['length'])
+        if d>pos or da>self.line_angle_deg or lr>self.line_length_ratio: return False
+        return True
+
+    def _geometry_regions(self,before,after,old_words,new_words,occupied):
+        """Detect only unmatched structural lines, then localize them.
+        No page-wide raster fallback is used here.
+        """
+        H,W=before.shape[:2]; old_lines=self._structural_lines(before,old_words); new_lines=self._structural_lines(after,new_words)
+        candidates=[]; used_new=set()
+        for oi,a in enumerate(old_lines):
+            matches=[]
+            for ni,b in enumerate(new_lines):
+                if ni in used_new: continue
+                if self._line_pair(a,b,W,H):
+                    matches.append((np.hypot(a['cx']-b['cx'],a['cy']-b['cy'])+abs(a['angle']-b['angle'])*2,ni,b))
+            if matches:
+                matches.sort(); _,ni,b=matches[0]; used_new.add(ni)
+                # A substantial length/angle deviation is a geometry change even if near-matched.
+                da=abs(a['angle']-b['angle']); da=min(da,180-da)
+                lr=abs(a['length']-b['length'])/max(a['length'],b['length'])
+                if da>3.0 or lr>.10:
+                    candidates.append((a,b,.82))
+            else:
+                candidates.append((a,None,.68))
+        for ni,b in enumerate(new_lines):
+            if ni not in used_new: candidates.append((None,b,.68))
+        regions=[]
+        for a,b,conf in candidates:
+            pts=[]
+            if a: pts += [(a['x1'],a['y1']),(a['x2'],a['y2'])]
+            if b: pts += [(b['x1'],b['y1']),(b['x2'],b['y2'])]
+            if not pts: continue
+            xs=[p[0] for p in pts]; ys=[p[1] for p in pts]; x=min(xs); y=min(ys); xx=max(xs); yy=max(ys)
+            pad=max(12,int(min(W,H)*.008)); box=Box(max(0,x-pad),max(0,y-pad),min(W,xx+pad)-max(0,x-pad),min(H,yy+pad)-max(0,y-pad))
+            if box.w<=8 or box.h<=8: continue
+            # Never let a structural line candidate swallow a known semantic text change.
+            if any(self._iou(box,q)>.55 for q in occupied): continue
+            # Reject very large page-spanning candidates.
+            if box.w>W*.45 and box.h>H*.45: continue
+            regions.append(ChangeRegion(box.x,box.y,box.w,box.h,box.w*box.h,0.0,'geometry_change',conf,
+                                        self._crop(before,box),self._crop(after,box),None,'','', 'geometry_change'))
+        return regions
+
     def _mergeable(self,a,b):
-        if a.change_kind != b.change_kind: return False
-        if a.change_kind == 'geometry_change': return False
+        if a.change_kind!=b.change_kind or a.change_kind=='geometry_change': return False
         ax,ay,axx,ayy=a.x,a.y,a.x+a.width,a.y+a.height; bx,by,bxx,byy=b.x,b.y,b.x+b.width,b.y+b.height
-        gapx=max(0,max(ax,bx)-min(axx,bxx)); gapy=max(0,max(ay,by)-min(ayy,byy))
-        overlap_x=max(0,min(axx,bxx)-max(ax,bx)); overlap_y=max(0,min(ayy,byy)-max(ay,by))
+        gapx=max(0,max(ax,bx)-min(axx,bxx)); gapy=max(0,max(ay,by)-min(ayy,byy)); overlap_x=max(0,min(axx,bxx)-max(ax,bx)); overlap_y=max(0,min(ayy,byy)-max(ay,by))
         return (gapx<=self.merge_gap and overlap_y>0) or (gapy<=self.merge_gap and overlap_x>0) or self._iou(Box(ax,ay,a.width,a.height),Box(bx,by,b.width,b.height))>.05
 
     def _merge_regions(self,regions,before,after):
-        """Merge only adjacent regions of the same semantic change kind.
-        This is deliberately not a global tile/connected-component merge.
-        """
         pending=list(regions); changed=True
         while changed:
             changed=False; out=[]
@@ -156,14 +240,9 @@ class ChangeDetector:
                 cur=pending.pop(0); merged=False
                 for i,other in enumerate(pending):
                     if not self._mergeable(cur,other): continue
-                    x=min(cur.x,other.x); y=min(cur.y,other.y); xx=max(cur.x+cur.width,other.x+other.width); yy=max(cur.y+cur.height,other.y+other.height)
-                    box=Box(x,y,xx-x,yy-y)
-                    old_text=' '.join(t for t in (cur.old_text,other.old_text) if t).strip()
-                    new_text=' '.join(t for t in (cur.new_text,other.new_text) if t).strip()
-                    cur=ChangeRegion(x,y,xx-x,yy-y,(xx-x)*(yy-y),0.0,cur.region_type,max(cur.confidence,other.confidence),
-                                     self._crop(before,box) if old_text else np.full((box.h,box.w,3),255,np.uint8),
-                                     self._crop(after,box) if new_text else np.full((box.h,box.w,3),255,np.uint8),
-                                     None,old_text,new_text,cur.change_kind)
+                    x=min(cur.x,other.x); y=min(cur.y,other.y); xx=max(cur.x+cur.width,other.x+other.width); yy=max(cur.y+cur.height,other.y+other.height); box=Box(x,y,xx-x,yy-y)
+                    old_text=' '.join(t for t in (cur.old_text,other.old_text) if t).strip(); new_text=' '.join(t for t in (cur.new_text,other.new_text) if t).strip()
+                    cur=ChangeRegion(x,y,xx-x,yy-y,(xx-x)*(yy-y),0.0,cur.region_type,max(cur.confidence,other.confidence),self._crop(before,box) if old_text else np.full((box.h,box.w,3),255,np.uint8),self._crop(after,box) if new_text else np.full((box.h,box.w,3),255,np.uint8),None,old_text,new_text,cur.change_kind)
                     pending.pop(i); merged=True; changed=True; break
                 if not merged: out.append(cur)
             pending=out
@@ -194,20 +273,16 @@ class ChangeDetector:
                     qb=self._box(q,10,W,H)
                     if not any(self._iou(qb,m)>0.02 or (abs(q['cx']-(m.x+m.w/2))<max(35,m.w) and abs(q['cy']-(m.y+m.h/2))<max(35,m.h)) for m in matched_boxes): continue
                     cls=q['class']; typ={'DIMENSION':'dimension_added' if side=='added' else 'dimension_deleted','GDT':'gdt_added' if side=='added' else 'gdt_deleted','NOTE':'note_added' if side=='added' else 'note_deleted','TEXT':'text_added' if side=='added' else 'text_deleted'}[cls]; b=qb.pad(8,W,H); self._add_region(regions,before,after,b,typ,q['text'] if side=='deleted' else '',q['text'] if side=='added' else '',.65)
-            if before.shape[:2]==after.shape[:2]:
-                a=self._gray(before); bgray=self._gray(after); d=cv2.absdiff(a,bgray); _,th=cv2.threshold(d,self.pixel_threshold,255,cv2.THRESH_BINARY); th=cv2.morphologyEx(th,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8)); n,_,stats,_=cv2.connectedComponentsWithStats(th,8)
-                for k in range(1,n):
-                    x,y,w,h,area=stats[k]
-                    if area<250 or area>before.size*.01: continue
-                    b=Box(int(x),int(y),int(w),int(h)).pad(8,W,H)
-                    if any(self._iou(b,Box(r.x,r.y,r.width,r.height))>.15 for r in regions): continue
-                    regions.append(ChangeRegion(b.x,b.y,b.w,b.h,b.w*b.h,area/max(1,b.w*b.h),'geometry_change',.60,self._crop(before,b),self._crop(after,b),self._crop(d,b),'','', 'geometry_change'))
+            # Geometry is detected structurally, never by page-wide pixel difference.
+            occupied=[Box(r.x,r.y,r.width,r.height) for r in regions if r.change_kind!='geometry_change']
+            geometry=self._geometry_regions(before,after,oldpx,new,occupied)
+            regions.extend(geometry)
             before_merge=len(regions); final=self._merge_regions(regions,before,after)
             final2=[]
             for r in sorted(final,key=lambda z:(z.confidence,z.area),reverse=True):
                 rb=Box(r.x,r.y,r.width,r.height)
                 if not any(self._iou(rb,Box(q.x,q.y,q.width,q.height))>.60 for q in final2): final2.append(r)
-            reason=f'v2 native={len(old)}/{len(raw_new)}, pairs={len(pairs)}, raw_regions={before_merge}, merged_regions={len(final)}, final={len(final2)}, unmatched={len(old)-len(used_o)}/{len(raw_new)-len(used_n)}'
+            reason=f'v3 native={len(old)}/{len(raw_new)}, pairs={len(pairs)}, semantic={before_merge-len(geometry)}, geometry={len(geometry)}, merged={len(final)}, final={len(final2)}, unmatched={len(old)-len(used_o)}/{len(raw_new)-len(used_n)}'
             return ChangeDetectionResult(True,final2,None,None,0.0,reason)
         except Exception as exc:
-            return ChangeDetectionResult(False,[],reason=f'v2_error: {type(exc).__name__}: {exc}')
+            return ChangeDetectionResult(False,[],reason=f'v3_error: {type(exc).__name__}: {exc}')
