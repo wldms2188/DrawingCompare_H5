@@ -63,7 +63,7 @@ class ChangeDetector:
     @staticmethod
     def _class(text,context=''):
         u=str(text).strip().upper(); c=str(context).upper()
-        if re.search(r'NOTE|NOTES|MATERIAL|FINISH|DEBURR|REMOVE|BURR|UNLESS|REMARK|COMMENT',c): return 'NOTE'
+        if re.search(r'NOTE|NOTES|MATERIAL|FINISH|DEBURR|BURR|UNLESS|REMARK|COMMENT',c): return 'NOTE'
         if re.search(r'POSITION|PROFILE|FLATNESS|PARALLEL|PERPENDICULAR|CONCENTRIC|RUNOUT|DATUM|MMC|LMC|POS',c): return 'GDT'
         if re.search(r'±|Ø|⌀|\bR\s*\d|^\d+(?:\.\d+)?$',u): return 'DIMENSION'
         return 'TEXT'
@@ -130,10 +130,6 @@ class ChangeDetector:
             used_o.add(i); used_n.add(j); pairs.append((old[i],new[j],score))
         return pairs,used_o,used_n
 
-    def _region_for_word(self,q,pad,W,H):
-        b=self._box(q,pad,W,H)
-        return b
-
     def _add_region(self,regions,before,after,b,kind,old_text='',new_text='',confidence=.65):
         blank=np.full((b.h,b.w,3),255,np.uint8)
         regions.append(ChangeRegion(b.x,b.y,b.w,b.h,b.w*b.h,0.0,kind,confidence,
@@ -159,8 +155,6 @@ class ChangeDetector:
                 cls=o['class']; ob=self._box(o,10,W,H); nb=self._box(n,10,W,H)
                 x=min(ob.x,nb.x); y=min(ob.y,nb.y); xx=max(ob.x+ob.w,nb.x+nb.w); yy=max(ob.y+ob.h,nb.y+nb.h); b=Box(x,y,xx-x,yy-y).pad(8,W,H)
                 conf=max(.55,min(.99,1-score))
-                # Free-form NOTE/TEXT replacements are semantically a deletion + addition.
-                # Engineering numeric/material codes remain a single changed-value record.
                 if cls in ('NOTE','TEXT') and not (self._value_like(o['text']) and self._value_like(n['text'])):
                     okind='note_deleted' if cls=='NOTE' else 'text_deleted'; nkind='note_added' if cls=='NOTE' else 'text_added'
                     self._add_region(regions,before,after,ob,okind,o['text'],'',conf)
