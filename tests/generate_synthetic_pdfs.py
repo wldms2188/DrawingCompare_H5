@@ -10,8 +10,8 @@ def make(path, after=False):
     p.draw_rect((30,30,812,565),width=1)
     p.draw_circle((250,280),80,color=(0,0,0),width=2)
     p.draw_rect((430,180,620,380),width=2)
-    p.draw_line((170,280,330,280),width=1)
-    p.draw_line((250,200,250,360),width=1)
+    p.draw_line((170,280),(330,280),width=1)
+    p.draw_line((250,200),(250,360),width=1)
     dims=[('Ø22' if after else 'Ø20',210,145),('40' if after else '35',500,145),('R6' if after else 'R5',325,410),('12±0.2' if after else '10±0.2',110,470)]
     for text,x,y in dims: p.insert_text((x,y),text,fontsize=14)
     note='MATERIAL: AL7075' if after else 'MATERIAL: AL6061'
